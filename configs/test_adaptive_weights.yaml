@@ -1,0 +1,95 @@
+current_thresholds:
+  min_score: 50
+  min_volume: 10000000
+current_weights:
+  expansion_score: 0.9
+  trend_score: 1.2
+snapshots:
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-09T01:12:43.323922'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T15:40:39.381526'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T15:45:50.240081'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T15:49:10.690120'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T16:00:18.809998'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T16:01:18.221268'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T16:02:35.858416'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2
+- metrics:
+    expectancy: 0.5
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 50
+    min_volume: 10000000
+  timestamp: '2026-03-23T16:04:26.850060'
+  weights:
+    expansion_score: 0.9
+    trend_score: 1.2

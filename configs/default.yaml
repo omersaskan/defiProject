@@ -1,0 +1,102 @@
+anchors:
+  - "BTC.p"
+  - "ETH.p"
+  - "AAVE.p"
+  - "UNI.p"
+  - "LINK.p"
+  - "LDO.p"
+  - "DYDX.p"
+  - "PENDLE.p"
+  - "ENA.p"
+
+data:
+  timeframes: ["15m", "1h", "4h"]
+  main_execution_timeframe: "15m"
+
+universe:
+  min_24h_quote_volume: 1000000.0
+  min_oi_usd: 500000.0
+  max_spread_bps: 15.0
+  min_listing_age_bars: 500
+  max_wick_ratio: 0.5
+  # GT-UNIVERSE: Strict whitelist for DeFi-only mode
+  defi_universe: [
+    "AAVE.p", "COMP.p", "MKR.p", "CRV.p", "RDNT.p", "LQTY.p", "MORPHO.p",
+    "UNI.p", "SUSHI.p", "CAKE.p", "RAY.p", "1INCH.p", "JUP.p", "COW.p", "CETUS.p",
+    "DYDX.p", "SNX.p", "GMX.p", "ENA.p", "DRIFT.p", "HMX.p",
+    "LINK.p", "BAND.p", "TRB.p", "API3.p", "PYTH.p",
+    "LDO.p", "RPL.p", "SSV.p", "STX.p",
+    "ETHFI.p", "REZ.p", "EIGEN.p", "PUFFER.p",
+    "PENDLE.p", "ENA.p", "GEAR.p",
+    "GRT.p", "NEAR.p", "TIA.p", "RUNE.p", "INJ.p", "PYTH.p", "GLM.p"
+  ]
+
+features:
+  horizon_returns: [1, 4, 12, 24]
+  zscore_window: 50
+  breakout_lookback: 20
+  retest_tolerance: 0.5
+
+ema:
+  fast: 20
+  medium: 55
+  slow: 200
+
+regimes:
+  min_volume: 1000000.0
+  min_oi: 500000.0
+  max_spread_bps: 15.0
+  overrides:
+    chop:
+      min_score: 80
+      min_relative_leadership: 15
+    trend:
+      min_score: 50
+    high_vol:
+      min_score: 70
+      min_volume: 2000000.0
+
+families:
+  lending:
+    primary_anchor: "AAVE.p"
+    members: ["AAVE.p", "COMP.p", "MKR.p", "CRV.p", "RDNT.p", "LQTY.p", "MORPHO.p"]
+  dex_amm:
+    primary_anchor: "UNI.p"
+    members: ["UNI.p", "SUSHI.p", "CAKE.p", "RAY.p", "1INCH.p", "JUP.p", "COW.p", "CETUS.p"]
+  perp_dex:
+    primary_anchor: "DYDX.p"
+    members: ["DYDX.p", "SNX.p", "GMX.p", "ENA.p", "DRIFT.p", "HMX.p"]
+  oracle:
+    primary_anchor: "LINK.p"
+    members: ["LINK.p", "BAND.p", "TRB.p", "API3.p", "PYTH.p"]
+  lsd:
+    primary_anchor: "LDO.p"
+    members: ["LDO.p", "RPL.p", "SSV.p"]
+  restaking:
+    primary_anchor: "EIGEN.p"
+    members: ["ETHFI.p", "REZ.p", "EIGEN.p", "PUFFER.p"]
+  yield:
+    primary_anchor: "PENDLE.p"
+    members: ["PENDLE.p", "ENA.p", "GEAR.p"]
+  infra:
+    primary_anchor: "ETH.p"
+    members: ["GRT.p", "NEAR.p", "TIA.p", "RUNE.p", "INJ.p", "GLM.p"]
+  rwa:
+    primary_anchor: "MKR.p"
+    members: ["MKR.p", "ONDO.p"]
+  defi_beta:
+    primary_anchor: "ETH.p"
+    members: []
+
+risk:
+  max_risk_per_trade_pct: 1.0
+  max_daily_loss_pct: 5.0
+  max_open_positions: 5
+  max_correlated_exposure: 2
+
+backtest:
+  fee_bps: 2.0
+  slippage_bps: 1.0
+  max_concurrent_positions: 5
+  funding_costs_enabled: false
+  time_stop_bars: 24

@@ -1,0 +1,22 @@
+current_thresholds:
+  min_score: 51
+  min_volume: 10500000
+current_weights:
+  expansion_score: 1.0
+  participation_score: 1.0
+  relative_leadership_score: 1.0
+  trend_score: 1.0
+snapshots:
+- metrics:
+    expectancy: 0.25
+    sample_size: 20
+    win_rate: 0.5
+  thresholds:
+    min_score: 51
+    min_volume: 10500000
+  timestamp: '2026-03-23T16:04:26.866030'
+  weights:
+    expansion_score: 1.0
+    participation_score: 1.0
+    relative_leadership_score: 1.0
+    trend_score: 1.0

@@ -1,0 +1,37 @@
+[
+    {
+        "timestamp": "2024-03-22 10:15:00",
+        "symbol": "AAVE.p",
+        "event": "ENTRY",
+        "score": 82.4,
+        "entry_price": 105.2,
+        "family": "defi_lending",
+        "ml_prob": 0.82,
+        "reason": "Family Breakout confirmed via 15m CVD expansion."
+    },
+    {
+        "timestamp": "2024-03-22 14:30:00",
+        "symbol": "UNI.p",
+        "event": "WATCH",
+        "score": 58.1,
+        "family": "defi_dex",
+        "ml_prob": 0.45,
+        "reason": "DiscoveryScore (58) passed but EntryReadiness (42) is too low. Peer-relative momentum is lagging."
+    },
+    {
+        "timestamp": "2024-03-22 18:45:00",
+        "symbol": "LDO.p",
+        "event": "EXIT_PARTIAL_TP1",
+        "price": 2.45,
+        "pnl_r": 1.0,
+        "reason": "Target 1 (1:1 RR) hit. Trailing stop set to break-even."
+    },
+    {
+        "timestamp": "2024-03-23 02:20:00",
+        "symbol": "LINK.p",
+        "event": "EXIT_LEADERSHIP_DECAY",
+        "price": 19.8,
+        "pnl_r": 2.1,
+        "reason": "LINK leadership score dropped -25% vs AAVE/UNI peers. Trend exhaustion detected via Wicked Exhaustion flag."
+    }
+]
