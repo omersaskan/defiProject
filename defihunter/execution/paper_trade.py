@@ -15,7 +15,10 @@ class PaperPosition(BaseModel):
     family: str
     status: str = "open"  # open, runner, closed_tp, closed_sl, closed_decay
     runner_size_pct: float = 50.0 # % of position to keep after TP1
+    partial_taken: bool = False
     peak_price_seen: float = 0.0
+    max_favorable_excursion: float = 0.0
+    giveback: float = 0.0
     exit_reason: str = ""
 
 class PaperPortfolio(BaseModel):
@@ -81,11 +84,11 @@ class PaperTradeEngine:
     def update_positions(self, current_prices: Dict[str, float], decay_signals: Dict[str, Any] = None):
         """
         GT-REDESIGN: Check open positions for SL/TP/Runner/Decay.
-        Supports Partial Take Profit at TP1.
+        Supports Partial Take Profit at TP1. Ensures robust state saving.
         """
         if decay_signals is None:
             decay_signals = {}
-        closed_any = False
+        state_changed = False
         remaining_positions = []
         
         for pos in self.portfolio.open_positions:
@@ -96,11 +99,23 @@ class PaperTradeEngine:
             curr_price = current_prices[pos.symbol]
             if curr_price > pos.peak_price_seen:
                 pos.peak_price_seen = curr_price
+                if pos.entry_price > 0:
+                    pos.max_favorable_excursion = (pos.peak_price_seen - pos.entry_price) / pos.entry_price
+                state_changed = True
                 
             closed = False
             
-            # 1. Stop Loss Check
-            if curr_price <= pos.stop_price:
+            # 1. Decay Exit Check (Highest Priority Patch 2)
+            if decay_signals.get(pos.symbol, {}).get("exit_signal", False):
+                pos.status = "closed_decay"
+                pos.exit_reason = decay_signals[pos.symbol].get("exit_reason", "Decay")
+                closed = True
+                pnl = (curr_price / pos.entry_price - 1) * pos.size_usd
+                self.portfolio.balance_usd += pnl
+                print(f"Paper Decay Exit: {pos.symbol} at {curr_price} (Reason: {pos.exit_reason})")
+
+            # 2. Stop Loss Check
+            elif curr_price <= pos.stop_price:
                 pos.status = "closed_sl"
                 pos.exit_reason = "Stop Loss Hit"
                 closed = True
@@ -108,7 +123,7 @@ class PaperTradeEngine:
                 self.portfolio.balance_usd += pnl
                 print(f"Paper SL Hit: {pos.symbol} at {curr_price} (PnL: ${pnl:.2f})")
                 
-            # 2. TP1 Check (Partial Take Profit)
+            # 3. TP1 Check (Partial Take Profit)
             elif pos.status == "open" and curr_price >= pos.tp1_price:
                 # Sell half (or runner_size_pct complement)
                 sell_ratio = (100.0 - pos.runner_size_pct) / 100.0
@@ -117,13 +132,14 @@ class PaperTradeEngine:
                 
                 # Update remaining position to "runner"
                 pos.status = "runner"
+                pos.partial_taken = True
                 pos.size_usd *= (pos.runner_size_pct / 100.0)
                 # Move SL to breakeven for the runner
                 pos.stop_price = pos.entry_price
-                
+                state_changed = True
                 print(f"Paper TP1 Hit (Partial): {pos.symbol} at {curr_price}. Runner active.")
 
-            # 3. TP2 Check (Final TP for runner) & Trailing Stop
+            # 4. TP2 Check (Final TP for runner) & Trailing Stop
             elif pos.status == "runner":
                 if curr_price >= pos.tp2_price:
                     pos.status = "closed_tp"
@@ -133,32 +149,25 @@ class PaperTradeEngine:
                     self.portfolio.balance_usd += pnl
                     print(f"Paper TP2 Hit: {pos.symbol} at {curr_price} (PnL: ${pnl:.2f})")
                 else:
-                    # Trailing Stop Logic
-                    # Once price surpasses 30% of the distance to TP2, start trailing the stop 20% behind the peak
+                    # Trailing Stop Logic (Patch 2)
                     reward_dist = pos.tp2_price - pos.entry_price
                     activation_price = pos.entry_price + (reward_dist * 0.3)
                     if pos.peak_price_seen > activation_price:
+                        # Trail 20% of reward distance behind peak
                         new_stop = pos.peak_price_seen - (reward_dist * 0.2)
-                        # Only move stop up, never down
                         if new_stop > pos.stop_price:
                             pos.stop_price = new_stop
-
-            # 4. Leadership Decay (Intelligent Exit)
-            elif decay_signals.get(pos.symbol, {}).get("exit_signal", False):
-                pos.status = "closed_decay"
-                pos.exit_reason = decay_signals[pos.symbol].get("exit_reason", "Decay")
-                closed = True
-                pnl = (curr_price / pos.entry_price - 1) * pos.size_usd
-                self.portfolio.balance_usd += pnl
-                print(f"Paper Decay Exit: {pos.symbol} at {curr_price} (Reason: {pos.exit_reason})")
+                            state_changed = True
 
             if closed:
+                if pos.peak_price_seen > 0:
+                    pos.giveback = (pos.peak_price_seen - curr_price) / pos.peak_price_seen
                 self.portfolio.trade_history.append(pos)
-                closed_any = True
+                state_changed = True
             else:
                 remaining_positions.append(pos)
                 
-        if closed_any:
+        if state_changed:
             self.portfolio.open_positions = remaining_positions
             self.portfolio.last_update = datetime.now().isoformat()
             self.save_state()

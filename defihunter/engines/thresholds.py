@@ -45,12 +45,14 @@ class ThresholdResolutionEngine:
                 if val is not None:
                     resolved[key] = val
                     
-        # 4. Family Overrides (Example implementations) 
-        if family == "lending":
-            resolved["breakout_buffer_atr"] = 0.8  # Needs a heavier breakout
-            resolved["min_score"] = max(resolved["min_score"] - 5, 0) # Slightly looser scores
-        elif family == "dex_amm":
-            resolved["retest_tolerance_atr"] = 0.5 # Looser retests
+        # 4. Family Overrides (Config-Driven Patch 4)
+        if family in self.thresholds_config.families:
+            family_config = self.thresholds_config.families[family]
+            overrides = getattr(family_config, 'threshold_overrides', {})
+            if isinstance(overrides, dict):
+                for key, val in overrides.items():
+                    if val is not None:
+                        resolved[key] = val
             
         # 5. Adaptive System Overrides (Highest Priority)
         if os.path.exists(self.adaptive_path):

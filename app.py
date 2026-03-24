@@ -375,53 +375,46 @@ elif secili_panel == "Strateji Laboratuvarı":
                 st.error("Borsa API'sinden veri alınamadı.")
 
 # ==========================================
-# PANEL 4: ML OPERASYONLARI
+# PANEL 4: ML OPERASYONLARI (LEADER ENGINE)
 # ==========================================
-elif secili_panel == "ML Operasyonları (Veri İzoleli)":
-    st.markdown("<div class='panel-title'>🧠 Coin-Bazlı (Per-Asset) Yapay Zeka Öğrenme Kontrolü</div>", unsafe_allow_html=True)
-    st.write("Veri sızıntısını (Data Leakage) önleyen V2 **Zaman Sıralı (Chronological Split)** modeli aktiftir. Tüm modeller genel değil, **coin'e özel** kurgulanmıştır.")
+elif secili_panel == "ML Operasyonları (Leader Engine)":
+    st.markdown("<div class='panel-title'>🏆 Global DeFi Family-Ranker Training Kontrolü</div>", unsafe_allow_html=True)
+    st.info("Bu panel, tüm DeFi evrenini kapsayan 'Top-3 Leader' tahminleme modelini yönetir. Bu model, coin'lerin kendi içsel güçlerini değil, **family içindeki relative performansını** optimize eder.")
     
     m1, m2 = st.columns([1, 2])
     with m1:
-        gun = st.number_input("Öğrenme Verisi Uzunluğu (Gün)", 15, 360, 60)
-        hedef = st.selectbox("Optimizasyon Hedefi", ["Maksimum Potansiyel (Regressor - MFE)", "Başarı Oranı (Classifier - Hit Rate)"])
-        hedef_kitle = st.selectbox("Eğitilecek Kitle", ["Sadece Mevcut Coinler", "Tüm Piyasa (Toplu Eğitim)"])
-        max_train_count = st.number_input("Maksimum Eğitilecek Coin Sayısı", 1, 500, 50)
+        st.markdown("### 🛠️ Global Model Eğitimi")
+        st.write("Hedef: `is_top3_family_next_24h` (Binary Classifier)")
         
-        st.write("")
-        st.write("---")
-    if st.sidebar.button("♻️ Önbelleği Temizle"):
-        st.cache_data.clear()
-        st.success("Önbellek temizlendi, veriler güncelleniyor...")
-        time.sleep(1)
-        st.rerun()
+        train_tf = st.selectbox("Eğitim Timeframe", ["15m", "1h", "4h"], index=0)
+        use_bootstrap = st.checkbox("Bootstrap Resampling Kullan (Robustness)", value=True)
+        
+        if st.button("🚀 GLOBAL EĞİTİMİ BAŞLAT", key="global_train_btn"):
+            with st.spinner(f"Global {train_tf} Family-Ranker eğitiliyor... Bu işlem dakikalar sürebilir."):
+                import subprocess
+                try:
+                    # Run the global training script as a subprocess to avoid blocking streamlit
+                    result = subprocess.run([sys.executable, "scripts/train_global.py", "--timeframes", train_tf], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        st.success(f"✅ {train_tf} Global Family-Ranker başarıyla eğitildi!")
+                        st.text_area("Eğitim Logu:", result.stdout, height=200)
+                    else:
+                        st.error("❌ Eğitim sırasında bir hata oluştu.")
+                        st.text_area("Hata Detayı:", result.stderr, height=200)
+                except Exception as e:
+                    st.error(f"Sistem Hatası: {e}")
 
-    if st.sidebar.button("🚀 Piyasayı Tara", key="tarama_baslat"):
-            from defihunter.engines.ml_ranking import MLRankingEngine
-            from defihunter.data.dataset_builder import DatasetBuilder
-            from defihunter.data.features import build_feature_pipeline
-            _ml_fetcher = BinanceFuturesFetcher()  # Local fetcher for ML panel
+        st.write("---")
+        st.markdown("### ⚠️ [LEGACY] Per-Coin Training")
+        st.warning("Eski tip 'target_hit' optimizasyonu. Sadece test amaçlıdır.")
+        if st.checkbox("Legacy Paneli Göster"):
+            gun = st.number_input("Öğrenme Verisi Uzunluğu (Gün)", 15, 360, 60)
+            hedef = st.selectbox("Optimizasyon Hedefi", ["Maksimum Potansiyel (Regressor - MFE)", "Başarı Oranı (Classifier - Hit Rate)"])
             
-            target_coins = []
-            if hedef_kitle == "Sadece Mevcut Coinler":
-                os.makedirs("models", exist_ok=True)
-                # Extract base symbol by stripping 'lgb_classifier_', 'long_', 'short_' and '.pkl'
-                raw_coins = []
-                for f in os.listdir("models"):
-                    if 'lgb_classifier_' in f and 'GLOBAL' not in f and 'calibrated' not in f:
-                        name = f.replace('lgb_classifier_', '').replace('.pkl', '')
-                        name = name.replace('long_', '').replace('short_', '')
-                        raw_coins.append(name)
-                target_coins = sorted(list(set(raw_coins))) if raw_coins else config.anchors
-                target_coins = target_coins[:int(max_train_count)]
-            else:
-                target_coins = _ml_fetcher.get_defi_universe()[:int(max_train_count)]  # Dinamik limit
-            
-            progress_bar = st.progress(0)
-            status_area = st.empty()
-            trained_ok = []
-            trained_fail = []
-            
+            if st.button("🚀 Legacy Eğitimi Başlat"):
+                st.warning("Legacy eğitimi başlatılıyor...")
+                # ... legacy loop logic ...
+   
             for i, coin in enumerate(target_coins):
                 progress_bar.progress((i + 1) / len(target_coins))
                 status_area.info(f"⚙️ Eğitiliyor: **{coin}** ({i+1}/{len(target_coins)})")

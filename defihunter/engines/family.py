@@ -34,19 +34,14 @@ class FamilyEngine:
                 primary_anchor = f_config.primary_anchor if hasattr(f_config, 'primary_anchor') else f_config.get('primary_anchor', "ETH.p")
                 break
         
-        # Base behavior from family (GT-UNIVERSE: Updated categories)
-        behavior = "breakout_continuation"
-        if family_label == "dex_amm":
-            behavior = "mean_reverting"
-        elif family_label in ["lending", "lsd"]:
-            # Lending and Staking are TVL-heavy, slow movers, retests are reliable
-            behavior = "retest_friendly"
-        elif family_label in ["oracle", "perp_dex", "infra"]:
-            # Catalyst driven, momentum/breakout friendly
-            behavior = "catalyst_sensitive"
-        elif family_label in ["restaking", "yield"]:
-            # High volatility, hype driven
-            behavior = "volatile_momentum"
+        # Base behavior from family (GT-UNIVERSE: Config-Driven Patch 4)
+        f_config = self.families.get(family_label)
+        if f_config:
+            behavior = getattr(f_config, 'behavior_profile', "breakout_continuation")
+            preferred_setups = getattr(f_config, 'preferred_setups', ["trend_pullback", "breakout"])
+        else:
+            behavior = "breakout_continuation"
+            preferred_setups = ["trend_pullback", "breakout"]
             
         # Data-driven behavior refinement (Section D requirement)
         if historical_data is not None and len(historical_data) > 20:

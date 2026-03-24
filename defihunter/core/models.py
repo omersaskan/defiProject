@@ -86,4 +86,10 @@ class FinalDecision(BaseModel):
     stop_price: float = 0.0
     tp1_price: float = 0.0
     tp2_price: float = 0.0
+    discovery_score: float = 0.0
+    entry_readiness: float = 0.0
+    fakeout_risk: float = 0.0
+    hold_quality: float = 0.0
+    leader_prob: float = 0.0
+    composite_leader_score: float = 0.0
     explanation: Dict[str, Any]

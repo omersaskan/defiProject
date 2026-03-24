@@ -1,28 +1,36 @@
-defi_families:
-  lending:
-    primary_anchor: "AAVE.p"
-    members: ["AAVE.p", "COMP.p", "MKR.p", "CRV.p", "RDNT.p", "LQTY.p"]
-  dex_amm:
-    primary_anchor: "UNI.p"
-    members: ["UNI.p", "SUSHI.p", "CAKE.p", "RAY.p", "1INCH.p", "JOE.p", "CVX.p", "BAL.p"]
-  derivatives:
-    primary_anchor: "DYDX.p"
-    members: ["DYDX.p", "GMX.p", "SNX.p", "INJ.p", "RLC.p", "CHZ.p"]
-  lsd_restaking:
-    primary_anchor: "LDO.p"
-    members: ["LDO.p", "PENDLE.p", "RPL.p", "SSV.p", "ETHFI.p", "REZ.p", "ENA.p"]
-  oracles:
-    primary_anchor: "LINK.p"
-    members: ["LINK.p", "BAND.p", "TRB.p", "API3.p", "PYTH.p"]
-  yield_infra:
-    primary_anchor: "RUNE.p"
-    members: ["RUNE.p", "KNC.p", "ALPHA.p", "REEF.p", "ZRX.p"]
-  cross_chain:
-    primary_anchor: "W.p"
-    members: ["W.p", "STG.p", "SYN.p"]
+defi_lending:
+  primary_anchor: "AAVE.p"
+  members: ["AAVE.p", "COMP.p", "MKR.p", "CRV.p", "RDNT.p", "LQTY.p"]
+  behavior_profile: "retest_friendly"
+  threshold_overrides: {"min_score": 45, "breakout_buffer_atr": 0.8}
+defi_dex:
+  primary_anchor: "UNI.p"
+  members: ["UNI.p", "SUSHI.p", "CAKE.p", "RAY.p", "1INCH.p", "JOE.p", "CVX.p", "BAL.p"]
+  behavior_profile: "mean_reverting"
+  threshold_overrides: {"retest_tolerance_atr": 0.5}
+defi_perp:
+  primary_anchor: "DYDX.p"
+  members: ["DYDX.p", "GMX.p", "SNX.p", "INJ.p", "RLC.p", "CHZ.p"]
+  behavior_profile: "catalyst_sensitive"
+defi_lst:
+  primary_anchor: "LDO.p"
+  members: ["LDO.p", "PENDLE.p", "RPL.p", "SSV.p", "ETHFI.p", "REZ.p", "ENA.p"]
+  behavior_profile: "retest_friendly"
+defi_oracles:
+  primary_anchor: "LINK.p"
+  members: ["LINK.p", "BAND.p", "TRB.p", "API3.p", "PYTH.p"]
+  behavior_profile: "catalyst_sensitive"
+defi_infra:
+  primary_anchor: "RUNE.p"
+  members: ["RUNE.p", "KNC.p", "ALPHA.p", "REEF.p", "ZRX.p"]
+  behavior_profile: "catalyst_sensitive"
+defi_bridge:
+  primary_anchor: "W.p"
+  members: ["W.p", "STG.p", "SYN.p"]
+  behavior_profile: "catalyst_sensitive"
 
 universe_filters:
   # Only symbols in these families will be scanned
-  strictly_defi: true
+  is_strictly_defi: true
   min_24h_quote_volume: 2000000.0  # Slightly stricter
   min_oi_usd: 1000000.0            # Slightly stricter

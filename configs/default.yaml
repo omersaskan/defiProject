@@ -57,31 +57,31 @@ regimes:
       min_volume: 2000000.0
 
 families:
-  lending:
+  defi_lending:
     primary_anchor: "AAVE.p"
     members: ["AAVE.p", "COMP.p", "MKR.p", "CRV.p", "RDNT.p", "LQTY.p", "MORPHO.p"]
-  dex_amm:
+  defi_dex:
     primary_anchor: "UNI.p"
     members: ["UNI.p", "SUSHI.p", "CAKE.p", "RAY.p", "1INCH.p", "JUP.p", "COW.p", "CETUS.p"]
-  perp_dex:
+  defi_perp:
     primary_anchor: "DYDX.p"
     members: ["DYDX.p", "SNX.p", "GMX.p", "ENA.p", "DRIFT.p", "HMX.p"]
-  oracle:
+  defi_oracles:
     primary_anchor: "LINK.p"
     members: ["LINK.p", "BAND.p", "TRB.p", "API3.p", "PYTH.p"]
-  lsd:
+  defi_lst:
     primary_anchor: "LDO.p"
     members: ["LDO.p", "RPL.p", "SSV.p"]
-  restaking:
+  defi_restaking:
     primary_anchor: "EIGEN.p"
     members: ["ETHFI.p", "REZ.p", "EIGEN.p", "PUFFER.p"]
-  yield:
+  defi_yield:
     primary_anchor: "PENDLE.p"
     members: ["PENDLE.p", "ENA.p", "GEAR.p"]
-  infra:
+  defi_infra:
     primary_anchor: "ETH.p"
     members: ["GRT.p", "NEAR.p", "TIA.p", "RUNE.p", "INJ.p", "GLM.p"]
-  rwa:
+  defi_rwa:
     primary_anchor: "MKR.p"
     members: ["MKR.p", "ONDO.p"]
   defi_beta:

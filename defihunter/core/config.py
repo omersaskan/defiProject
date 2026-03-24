@@ -13,7 +13,7 @@ class UniverseConfig(BaseModel):
     max_spread_bps: float = 15.0
     min_listing_age_bars: int = 500
     max_wick_ratio: float = 0.5
-    strictly_defi: bool = False
+    is_strictly_defi: bool = True
     defi_universe: List[str] = Field(default_factory=list)
 
 class FeatureConfig(BaseModel):
@@ -49,6 +49,9 @@ class RegimeConfig(BaseModel):
 class FamilyConfigItem(BaseModel):
     primary_anchor: str
     members: List[str]
+    behavior_profile: Optional[str] = "breakout_continuation"
+    preferred_setups: Optional[List[str]] = Field(default_factory=lambda: ["trend_pullback", "breakout"])
+    threshold_overrides: Optional[Dict[str, Any]] = Field(default_factory=dict)
     
 class RiskConfig(BaseModel):
     max_risk_per_trade_pct: float = 1.0
@@ -65,6 +68,20 @@ class AlertConfig(BaseModel):
     telegram_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
 
+class LabelingConfig(BaseModel):
+    primary_target: str = "is_top3_family_next_24h"
+    horizon_hours: int = 24
+
+class TrainingConfig(BaseModel):
+    primary_objective: str = "family_ranker"
+    fallback_legacy: bool = False
+
+class DecisionConfig(BaseModel):
+    use_layered_logic: bool = True
+
+class ExitConfig(BaseModel):
+    enable_leadership_decay: bool = True
+
 class AppConfig(BaseModel):
     anchors: List[str] = ["BTC.p", "ETH.p", "AAVE.p", "UNI.p"]
     timeframe: str = "15m"
@@ -77,6 +94,10 @@ class AppConfig(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
+    labeling: LabelingConfig = Field(default_factory=LabelingConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    decision: DecisionConfig = Field(default_factory=DecisionConfig)
+    exit: ExitConfig = Field(default_factory=ExitConfig)
     
 def load_config(path: str | Path) -> AppConfig:
     with open(path, 'r') as f:
