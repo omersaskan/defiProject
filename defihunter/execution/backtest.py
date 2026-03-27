@@ -165,7 +165,7 @@ class BacktestEngine:
             corr = ts_data['ml_rank_score'].corr(ts_data['future_return'], method='spearman')
             if not np.isnan(corr): correlations.append(corr)
             
-            # 2. Top-K Precision
+            # 2. Top-K Precision and Recall
             top_k_pred = set(ts_data.nlargest(k, 'ml_rank_score')['symbol'])
             top_k_actual = set(ts_data.nlargest(k, 'future_return')['symbol'])
             precisions.append(len(top_k_pred & top_k_actual) / k)
@@ -184,12 +184,31 @@ class BacktestEngine:
                 if not selected_ranks.empty:
                     family_ranks.append(selected_ranks.mean())
             
+        # Calculate derived metrics for overall performance
+        t_df = pd.DataFrame(self.trade_log)
+        hold_eff, exit_eff = 0, 0
+        if not t_df.empty and 'peak_pnl_r' in t_df.columns:
+            # hold_efficiency = avg R realized / avg peak R seen
+            realized_trades = t_df[t_df['pnl_r'] > 0]
+            if not realized_trades.empty:
+                realized = realized_trades['pnl_r'].mean()
+                peak = realized_trades['peak_pnl_r'].mean()
+                if peak and peak > 0:
+                    hold_eff = round((realized / peak) * 100, 1)
+                
+                # exit_efficiency = % of trades capturing at least 50% of peak R
+                exit_eff_count = len(realized_trades[realized_trades['pnl_r'] >= realized_trades['peak_pnl_r'] * 0.5])
+                exit_eff = round((exit_eff_count / len(realized_trades)) * 100, 1)
+
         return {
             "rank_correlation": round(np.nanmean(correlations), 3) if correlations else 0,
             "top_k_precision": round(np.nanmean(precisions) * 100, 1) if precisions else 0,
+            "top_k_recall": round(np.nanmean(precisions) * 100, 1) if precisions else 0,
             "leader_capture_rate": round(np.nanmean(capture_rates) * 100, 1) if capture_rates else 0,
             "avg_selected_future_family_rank": round(np.nanmean(family_ranks), 2) if family_ranks else 0,
             "missed_leaders": missed_count,
+            "hold_efficiency": hold_eff,
+            "exit_efficiency": exit_eff,
             "n_timestamps": len(correlations)
         }
 

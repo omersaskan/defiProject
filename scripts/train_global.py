@@ -153,6 +153,7 @@ def main():
             target_short_col='short_target_hit', 
             target_reg_col='future_24h_rank_in_family_pct' if 'future_24h_rank_in_family_pct' in combined_df.columns else 'mfe_r'
         )
+        print(f"[{tf}] Primary objective log complete: {target_clf}")
         print(f"Training fully completed for {tf} models.")
 
 if __name__ == '__main__':

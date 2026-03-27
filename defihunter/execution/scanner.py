@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import csv
 import pandas as pd
 import numpy as np
 import pytz
@@ -27,6 +28,33 @@ from defihunter.data.features import compute_family_features
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+from concurrent.futures import ThreadPoolExecutor
+
+def log_shadow(decisions, universe_size):
+    """GT #18: Shadow Verification Mode Logging."""
+    log_file = "logs/shadow_log.csv"
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    file_exists = os.path.exists(log_file)
+    
+    with open(log_file, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['timestamp', 'evaluated_universe_size', 'symbol', 'family', 'discovery_score', 'entry_readiness', 'fakeout_risk', 'hold_quality', 'leader_prob', 'composite_leader_score', 'suggested_action'])
+        
+        for d in decisions:
+            writer.writerow([
+                d.timestamp if hasattr(d, 'timestamp') and d.timestamp else datetime.now(pytz.utc).isoformat(),
+                universe_size,
+                d.symbol,
+                d.explanation.get('family', 'unknown'),
+                d.explanation.get('discovery_score', 0),
+                d.explanation.get('entry_readiness', 0),
+                d.explanation.get('fakeout_risk', 0),
+                d.explanation.get('hold_quality', 0),
+                d.explanation.get('leader_prob', 0),
+                d.final_trade_score,
+                d.decision
+            ])
 
 def detect_momentum_cluster(rows: list) -> dict:
     """
@@ -261,7 +289,7 @@ def run_scanner(config, force_regime=None, limit=0):
     risk_engine = RiskEngine(config.risk.dict(), fetcher=fetcher)
     broadcaster = SignalBroadcaster(config=config)
     
-    threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes)
+    threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes, config=config)
     rule_engine = RuleEngine()
     
     # 2. Evaluate Global Market Regime (True MTF)
@@ -449,7 +477,10 @@ def run_scanner(config, force_regime=None, limit=0):
     # 6. Entry & Decision Layer
     # DecisionEngine now handles the CompositeLeaderScore and SuggestedAction
     final_decisions = decision_engine.process_candidates(master_df)
-        
+    
+    # GT-GOLD: Save shadow log
+    log_shadow(final_decisions, len(watch_list))
+    
     # Update Paper Positions
     paper_engine.update_positions(current_market_prices, decay_signals=decay_signals)
 

@@ -108,8 +108,11 @@ def load_config(path: str | Path) -> AppConfig:
     if groups_path.exists():
         with open(groups_path, 'r') as f:
             groups_data = yaml.safe_load(f)
-            if 'defi_families' in groups_data:
-                data['families'] = {**data.get('families', {}), **groups_data['defi_families']}
+            
+            families_data = {k: v for k, v in groups_data.items() if k != 'universe_filters'}
+            if families_data:
+                data['families'] = {**data.get('families', {}), **families_data}
+                
             if 'universe_filters' in groups_data:
                 data['universe'] = {**data.get('universe', {}), **groups_data['universe_filters']}
                 

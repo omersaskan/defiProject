@@ -2,8 +2,9 @@ import yaml
 import os
 
 class ThresholdResolutionEngine:
-    def __init__(self, thresholds_config: dict, adaptive_path: str = "configs/adaptive_weights.yaml"):
+    def __init__(self, thresholds_config: dict = None, config=None, adaptive_path: str = "configs/adaptive_weights.yaml"):
         self.thresholds_config = thresholds_config
+        self.config = config
         self.adaptive_path = adaptive_path
         
     def resolve_thresholds(self, regime: str, family: str) -> dict:
@@ -46,8 +47,14 @@ class ThresholdResolutionEngine:
                     resolved[key] = val
                     
         # 4. Family Overrides (Config-Driven Patch 4)
-        if family in self.thresholds_config.families:
-            family_config = self.thresholds_config.families[family]
+        families_dict = {}
+        if self.config and hasattr(self.config, 'families'):
+            families_dict = self.config.families
+        elif hasattr(self.thresholds_config, "families"):
+            families_dict = self.thresholds_config.families
+            
+        if family in families_dict:
+            family_config = families_dict[family]
             overrides = getattr(family_config, 'threshold_overrides', {})
             if isinstance(overrides, dict):
                 for key, val in overrides.items():

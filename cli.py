@@ -18,7 +18,7 @@ def main():
     bt_parser.add_argument('--ablation', action='store_true', help='Run ablation study over leadership features')
     
     # Family ranker command
-    ranker_parser = subparsers.add_parser('train-family-ranker', help='Train global DeFi family-ranker model')
+    ranker_parser = subparsers.add_parser('train-family-ranker', help='[PRIMARY] Train global DeFi family-ranker model (is_top3_family_next_24h)')
     ranker_parser.add_argument('--days', type=int, default=60, help='Days of history to use for training')
 
     args = parser.parse_args()

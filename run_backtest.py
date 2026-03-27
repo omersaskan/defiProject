@@ -39,7 +39,7 @@ def run_historical_backtest(config_path="configs/default.yaml", limit=1000, k=3)
     regime_engine = MarketRegimeEngine()
     family_engine = FamilyEngine(config)
     leadership_engine = LeadershipEngine(anchors=config.anchors, ema_lengths=[config.ema.fast, config.ema.medium])
-    threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes)
+    threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes, config=config)
     rule_engine = RuleEngine()
     discovery_engine = DiscoveryEngine()
     

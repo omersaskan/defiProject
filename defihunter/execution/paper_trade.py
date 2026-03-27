@@ -161,7 +161,7 @@ class PaperTradeEngine:
 
             if closed:
                 if pos.peak_price_seen > 0:
-                    pos.giveback = (pos.peak_price_seen - curr_price) / pos.peak_price_seen
+                    pos.giveback = (pos.peak_price_seen - curr_price) / pos.entry_price
                 self.portfolio.trade_history.append(pos)
                 state_changed = True
             else:

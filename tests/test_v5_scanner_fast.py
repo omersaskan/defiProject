@@ -35,6 +35,18 @@ def test_v5_scanner_fast(mock_fetcher_class):
         # run_scanner returns top results
         decisions = run_scanner(config)
         print(f"✅ Scanner Cycle Complete. Decisions produced: {len(decisions)}")
+        
+        # New robust assertions
+        assert isinstance(decisions, list), "Scanner should return a list of decisions"
+        if len(decisions) > 0:
+            d = decisions[0]
+            assert hasattr(d, 'symbol'), "Decision missing symbol"
+            assert hasattr(d, 'final_trade_score'), "Decision missing final_trade_score"
+            assert hasattr(d, 'explanation'), "Decision missing explanation dictionary"
+            if hasattr(d, 'explanation'):
+                 assert 'family' in d.explanation, "Decision missing family metadata"
+                 assert 'discovery_score' in d.explanation, "Decision missing discovery_score"
+            
         print("=== SCANNER INTEGRATION SUCCESS ===\n")
         return True
     except Exception as e:

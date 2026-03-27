@@ -111,7 +111,7 @@ with c_head2:
     # Sekmeler yerine yatay radyo butonları (Daha panelvari görünüm için)
     secili_panel = st.radio(
         "",
-        ["Komuta Merkezi (Tarayıcı)", "Sanal Portföy & Risk", "Strateji Laboratuvarı", "ML Operasyonları (Veri İzoleli)", "Sistem & Konfigürasyon"],
+        ["Komuta Merkezi (Tarayıcı)", "Sanal Portföy & Risk", "Strateji Laboratuvarı", "ML Operasyonları (Leader Engine)", "Sistem & Konfigürasyon"],
         horizontal=True,
         label_visibility="collapsed"
     )
@@ -484,7 +484,7 @@ elif secili_panel == "ML Operasyonları (Leader Engine)":
             
             # ── Özet metrikler ─────────────────────────────────────────────────
             n_models = len(rows)
-            avg_auc  = pd.DataFrame(rows)['📈 CV AUC'].mean() if '📈 CV AUC' in pd.DataFrame(rows).columns else 0.5
+            avg_auc  = pd.DataFrame(rows)['📈 Leader AUC'].mean() if '📈 Leader AUC' in pd.DataFrame(rows).columns else 0.5
             last_any = max((r.get('🕐 Son Tarama', '') or '' for r in rows), default='—')
             
             ms1, ms2, ms3, ms4 = st.columns(4)
