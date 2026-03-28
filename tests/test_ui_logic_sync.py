@@ -60,9 +60,25 @@ def test_sync():
     top = decisions[0]
     print(f"Top Decision: {top.symbol} | Score: {top.final_trade_score} | Decision: {top.decision}")
     
-    # Simple check for composite score 
+    # Check composite score
     assert top.final_trade_score > 0
     print(f"SUCCESS: Decision Engine calculated final score correctly using standardized keys.")
+
+    # ── TOP-LEVEL FIELD ASSERTIONS (Patch 2 schema contract) ────────────────
+    assert top.discovery_score >= 0, \
+        f"discovery_score must be >= 0, got {top.discovery_score}"
+    assert top.composite_leader_score >= 0, \
+        f"composite_leader_score must be >= 0, got {top.composite_leader_score}"
+    assert top.final_trade_score == top.composite_leader_score, \
+        f"final_trade_score ({top.final_trade_score}) != composite_leader_score ({top.composite_leader_score})"
+    assert 0.0 <= top.leader_prob <= 1.0, \
+        f"leader_prob out of range: {top.leader_prob}"
+    assert top.entry_readiness >= 0, \
+        f"entry_readiness must be >= 0, got {top.entry_readiness}"
+    # explanation dict still has family + triggers
+    assert 'family' in top.explanation, "explanation must still contain 'family'"
+    assert 'triggers' in top.explanation, "explanation must still contain 'triggers'"
+    print("SUCCESS: All top-level FinalDecision fields correctly populated.")
 
 if __name__ == "__main__":
     test_sync()

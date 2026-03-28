@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from defihunter.core.config import load_config
-from defihunter.data.binance_fetcher import BinanceFuturesFetcher
+import sys
 import os
 import time
 import pytz
+from datetime import datetime
+from defihunter.core.config import load_config
+from defihunter.data.binance_fetcher import BinanceFuturesFetcher
 
 # --- SAYFA YAPILANDIRMASI ---
 st.set_page_config(
@@ -98,6 +99,8 @@ def canli_piyasa_durumu():
             sector = sector_engine.get_sector_regime(eth_1h, aave_1h, uni_1h)
             return regime, sector
     except Exception as e:
+        import logging
+        logging.error(f"Live market status fetch failed: {e}", exc_info=True)
         pass
     return {"label": "CHOP", "confidence": 0.5, "volatility": "normal"}, {"label": "neutral", "strongest_family": "eth"}
 
@@ -196,13 +199,15 @@ if secili_panel == "Komuta Merkezi (Tarayıcı)":
                         
                     gosterilecek_veriler.append({
                         "Sembol": d.symbol,
+                        # family remains in explanation dict by design
                         "Family": d.explanation.get('family', '—'),
-                        "Disc_S 🎯": round(d.explanation.get('discovery_score', 0), 1),
-                        "Ready_S ⚡": round(d.explanation.get('entry_readiness', 0), 1),
-                        "Risk_F ⚠️": round(d.explanation.get('fakeout_risk', 0), 1),
-                        "Hold_Q 💎": round(d.explanation.get('hold_quality', 0), 1),
-                        "L_Prob 📈": f"{d.explanation.get('leader_prob', 0)*100:.0f}%",
-                        "Comp_S 🏆": round(d.final_trade_score, 1),
+                        # ── Top-level fields (primary source of truth) ──────
+                        "Disc_S 🎯": round(d.discovery_score, 1),
+                        "Ready_S ⚡": round(d.entry_readiness, 1),
+                        "Risk_F ⚠️": round(d.fakeout_risk, 1),
+                        "Hold_Q 💎": round(d.hold_quality, 1),
+                        "L_Prob 📈": f"{d.leader_prob * 100:.0f}%",
+                        "Comp_S 🏆": round(d.composite_leader_score, 1),
                         "Aksiyon": d.decision,
                         "Fiyat 💰": round(d.entry_price, 4),
                         "Triggers 🛠️": ", ".join(d.explanation.get('triggers', [])),
@@ -273,7 +278,8 @@ elif secili_panel == "Sanal Portföy & Risk":
 # PANEL 3: STRATEJİ LABORATUVARI
 # ==========================================
 elif secili_panel == "Strateji Laboratuvarı":
-    st.markdown("<div class='panel-title'>📉 Gelişmiş Tarihsel Simülasyon (Walk-Forward Backtest)</div>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-title'>📉 Single-Coin Tactical Lab — Tarihsel Simülasyon</div>", unsafe_allow_html=True)
+    st.caption("ℹ️ Bu panel tek coin üzerinde çalışır. Cross-sectional (family-aware) validasyon için CLI: `python cli.py backtest --k 3`")
     
     b1, b2, b3, b4 = st.columns(4)
     # Find all trained coins
@@ -319,7 +325,8 @@ elif secili_panel == "Strateji Laboratuvarı":
                 # Also resolve the correct family for the selected coin
                 from defihunter.engines.thresholds import ThresholdResolutionEngine
                 from defihunter.engines.family import FamilyEngine
-                bt_threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes)
+                # Fix #2: config= geçirilmezse family threshold_overrides uygulanmaz
+                bt_threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes, config=config)
                 bt_family_engine = FamilyEngine(config)
                 bt_profile = bt_family_engine.profile_coin(secili_coin, historical_data=df)
                 resolved_bt_thresholds = bt_threshold_engine.resolve_thresholds(
@@ -342,27 +349,38 @@ elif secili_panel == "Strateji Laboratuvarı":
                 sr1.metric("Win Rate", f"%{rapor.get('win_rate', 0)}")
                 sr2.metric("Expectancy", f"{rapor.get('expectancy_r', 0)} R")
                 sr3.metric("Profit Factor", rapor.get('profit_factor', 0))
-                sr4.metric("Hold Efficiency", f"%{int(rapor.get('avg_hold_efficiency', 0)*100)}")
-                sr5.metric("Giveback Ratio", f"%{int(rapor.get('avg_giveback_ratio', 0)*100)}")
+                # Fix #3d: simulate() bu metrikleri döndürmüyor; doğru key'ler kullanılıyor
+                sr4.metric("Toplam İşlem", rapor.get('total_trades', 0))
+                sr5.metric("Ort. Tutuş (Bar)", rapor.get('avg_bars_held', 0))
                 
                 # Ranking Quality Section
                 st.markdown("<div class='panel-title'>🥇 Lider Yakalama Analizi (Ranking Quality)</div>", unsafe_allow_html=True)
-                # We need multiple coins to run the ranking quality check
-                bt_anchors_data = {a: build_feature_pipeline(fetcher.fetch_ohlcv(a, timeframe='1h', limit=500)) for a in trained_coins[:10]}
-                # Add rank scores to all
-                for c, cdf in bt_anchors_data.items():
-                    bt_anchors_data[c] = re.evaluate(cdf, regime="MTF_Historical", family="unknown", resolved_thresholds=resolved_bt_thresholds)
+                # Fix #3c: evaluate_ranking_quality bir pd.DataFrame bekliyor, dict değil
+                bt_coins_raw = {a: build_feature_pipeline(fetcher.fetch_ohlcv(a, timeframe='1h', limit=500)) for a in trained_coins[:10]}
+                bt_coins_eval = {}
+                for c, cdf in bt_coins_raw.items():
+                    if not cdf.empty:
+                        bt_coins_eval[c] = re.evaluate(cdf, regime="MTF_Historical", family="unknown", resolved_thresholds=resolved_bt_thresholds)
                 
-                rank_report = bt_engine.evaluate_ranking_quality(bt_anchors_data)
+                if bt_coins_eval:
+                    bt_combined_df = pd.concat(
+                        [cdf.assign(symbol=c) for c, cdf in bt_coins_eval.items()],
+                        ignore_index=True
+                    )
+                    if 'ml_rank_score' not in bt_combined_df.columns:
+                        bt_combined_df['ml_rank_score'] = bt_combined_df.get('discovery_score', pd.Series(0, index=bt_combined_df.index))
+                    rank_report = bt_engine.evaluate_ranking_quality(bt_combined_df, bars_horizon=24, k=3)
+                else:
+                    rank_report = {}
                 
                 rk1, rk2, rk3, rk4 = st.columns(4)
-                rk1.metric("Top-5 Precision", f"%{rank_report.get('top_k_precision', 0)}")
+                rk1.metric("Top-3 Precision", f"%{rank_report.get('top_k_precision', 0)}")
                 rk2.metric("Leader Capture", f"%{rank_report.get('leader_capture_rate', 0)}")
                 rk3.metric("Rank Correlation", f"{rank_report.get('rank_correlation', 0)}")
                 rk4.metric("Missed Leaders", rank_report.get('missed_leaders', 0))
                 
                 if rank_report.get('missed_leaders', 0) > 0:
-                    st.warning(f"Sistem toplam {rank_report.get('n_timestamps_evaluated')} zaman diliminde {rank_report.get('missed_leaders')} adet gerçek lideri (Top-1) yakalayamadı.")
+                    st.warning(f"Sistem {rank_report.get('n_timestamps', 0)} zaman diliminde {rank_report.get('missed_leaders')} adet gerçek lideri (Top-1) yakalayamadı.")
                 
                 st.markdown("<div class='panel-title'>Kümülatif Getiri Eğrisi (R-Multiples)</div>", unsafe_allow_html=True)
                 if bt_engine.trade_log:
@@ -406,49 +424,9 @@ elif secili_panel == "ML Operasyonları (Leader Engine)":
 
         st.write("---")
         st.markdown("### ⚠️ [LEGACY] Per-Coin Training")
-        st.warning("Eski tip 'target_hit' optimizasyonu. Sadece test amaçlıdır.")
-        if st.checkbox("Legacy Paneli Göster"):
-            gun = st.number_input("Öğrenme Verisi Uzunluğu (Gün)", 15, 360, 60)
-            hedef = st.selectbox("Optimizasyon Hedefi", ["Maksimum Potansiyel (Regressor - MFE)", "Başarı Oranı (Classifier - Hit Rate)"])
-            
-            if st.button("🚀 Legacy Eğitimi Başlat"):
-                st.warning("Legacy eğitimi başlatılıyor...")
-                # ... legacy loop logic ...
-   
-            for i, coin in enumerate(target_coins):
-                progress_bar.progress((i + 1) / len(target_coins))
-                status_area.info(f"⚙️ Eğitiliyor: **{coin}** ({i+1}/{len(target_coins)})")
-                try:
-                    df_raw = fetcher.fetch_historical_ohlcv(coin, timeframe='1h', days=int(gun))
-                    if df_raw.empty or len(df_raw) < 100:
-                        trained_fail.append(f"{coin} (yetersiz veri)")
-                        continue
-                    df_feat = build_feature_pipeline(df_raw)
-                    
-                    # Build ML labels (target_hit, mfe_r)
-                    builder = DatasetBuilder()
-                    df_labeled = builder.build(df_feat)
-                    
-                    if df_labeled.empty or 'target_hit' not in df_labeled.columns:
-                        trained_fail.append(f"{coin} (label üretilemedi)")
-                        continue
-                    
-                    ml_eng = MLRankingEngine()
-                    success = ml_eng.train(df_labeled, symbol=coin)
-                    
-                    if success:
-                        trained_ok.append(coin)
-                    else:
-                        trained_fail.append(f"{coin} (tek sınıf)")
-                except Exception as e:
-                    trained_fail.append(f"{coin} ({str(e)[:40]})")
-            
-            status_area.empty()
-            progress_bar.empty()
-            if trained_ok:
-                st.success(f"✅ {len(trained_ok)} model başarıyla eğitildi: {', '.join(trained_ok)}")
-            if trained_fail:
-                st.warning(f"⚠️ {len(trained_fail)} coin atlandı: {', '.join(trained_fail)}")
+        st.warning("Eski tip 'target_hit' optimizasyonu. Kaldırıldı — Global Family-Ranker kullanın.")
+        # Fix #3b: Undefined değişkenler (target_coins, progress_bar, status_area, MLRankingEngine)
+        # içeren kırık legacy loop tamamen temizlendi. Yeni sistem scripts/train_global.py kullanıyor.
                 
     with m2:
         st.markdown("<div class='panel-title'>📋 Eğitilmiş Model Envanteri & Sağlık Durumu</div>", unsafe_allow_html=True)
@@ -519,6 +497,7 @@ elif secili_panel == "ML Operasyonları (Leader Engine)":
                 onem_df = onem_df.sort_values('Önem Derecesi', ascending=False).head(10)
             except: pass
         
+        md = {}
         if os.path.exists(metrics_path):
             try:
                 md = joblib.load(metrics_path)
@@ -528,7 +507,7 @@ elif secili_panel == "ML Operasyonları (Leader Engine)":
         
         fi1, fi2 = st.columns(2)
         fi1.metric(f"{diag_coin} — Long AUC", f"{auc_val:.3f}", help="0.5 = random, 1.0 = perfect")
-        fi2.metric(f"{diag_coin} — Folds", md.get('wf_folds', 1) if os.path.exists(metrics_path) else "N/A")
+        fi2.metric(f"{diag_coin} — Folds", md.get('wf_folds', 1) if md else "N/A")
         
         if not onem_df.empty:
             st.bar_chart(onem_df.set_index('Değişken Adı'))

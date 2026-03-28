@@ -85,36 +85,36 @@ def run_historical_backtest(config_path="configs/default.yaml", limit=1000, k=3)
     bt_engine = BacktestEngine(config=config)
     
     bars_horizon = 96 if config.timeframe == '15m' else (24 if config.timeframe == '1h' else 6)
-    metrics = bt_engine.evaluate_ranking_quality(combined_df, bars_horizon=bars_horizon, k=k)
-    print("\n[LEADER CAPTURE METRICS]")
-    for k_metric, v_metric in metrics.items():
-        print(f"{k_metric}: {v_metric}")
-        
-    print(f"\nRunning Top-{k} cross-sectional event simulation...")
-    
-    # Needs to be sorted by timestamp to group
+
+    # Fix #4: simulate() önce çalıştırılmalı ki trade_log dolsun;
+    # evaluate_ranking_quality sonra çağrılırsa hold_efficiency / exit_efficiency sağlıklı döner.
+    print(f"\nRunning Top-{k} cross-sectional event simulation first...")
     combined_df = combined_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
-    
+
     def select_top_k(group):
         group['is_top_k'] = False
         top_indices = group.nlargest(k, 'ml_rank_score').index
         group.loc[top_indices, 'is_top_k'] = True
         return group
-        
+
     combined_df = combined_df.groupby('timestamp', group_keys=False).apply(select_top_k)
-    
     combined_df['entry_signal'] = combined_df['is_top_k'] & (combined_df['entry_readiness'] > 0)
-    
+
     signals = combined_df[combined_df['entry_signal']]
     print(f"Generated {len(signals)} true cross-sectional entry signals.")
-    
+
     results = bt_engine.simulate(combined_df)
-    
     print("\n[BACKTEST RESULTS]")
     print(f"Total Trades: {results.get('total_trades')}")
     print(f"Win Rate: {results.get('win_rate')}%")
     print(f"Profit Factor: {results.get('profit_factor')}")
     print(f"Expectancy (R): {results.get('expectancy_r')}")
+
+    # Now evaluate ranking quality — trade_log already populated from simulate()
+    metrics = bt_engine.evaluate_ranking_quality(combined_df, bars_horizon=bars_horizon, k=k)
+    print("\n[LEADER CAPTURE METRICS]")
+    for k_metric, v_metric in metrics.items():
+        print(f"{k_metric}: {v_metric}")
 
 if __name__ == "__main__":
     run_historical_backtest(k=3, limit=1000)

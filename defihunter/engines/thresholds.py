@@ -1,5 +1,6 @@
 import yaml
 import os
+from defihunter.utils.logger import logger
 
 class ThresholdResolutionEngine:
     def __init__(self, thresholds_config: dict = None, config=None, adaptive_path: str = "configs/adaptive_weights.yaml"):
@@ -16,15 +17,15 @@ class ThresholdResolutionEngine:
         4. Family overrides
         5. Adaptive Systems Data (Highest Priority)
         """
-        # 1. Base Defaults
+        # 1. Base Defaults (Pull from RegimeConfig if possible)
         resolved = {
-            "min_score": 50,
-            "min_relative_leadership": 0,
-            "min_volume": 10_000_000,
-            "max_spread_bps": 15.0,
-            "breakout_buffer_atr": 0.5,
-            "retest_tolerance_atr": 0.3,
-            "time_stop_bars": 24
+            "min_score": getattr(self.thresholds_config, 'min_score', 50),
+            "min_relative_leadership": getattr(self.thresholds_config, 'min_relative_leadership', 0),
+            "min_volume": getattr(self.thresholds_config, 'min_volume', 10_000_000),
+            "max_spread_bps": getattr(self.thresholds_config, 'max_spread_bps', 15.0),
+            "breakout_buffer_atr": getattr(self.thresholds_config, 'breakout_buffer_atr', 0.5),
+            "retest_tolerance_atr": getattr(self.thresholds_config, 'retest_tolerance_atr', 0.3),
+            "time_stop_bars": getattr(self.thresholds_config, 'time_stop_bars', 24)
         }
         
         # Pull from config if it exists
@@ -72,6 +73,6 @@ class ThresholdResolutionEngine:
                             if key in adapted:
                                 resolved[key] = adapted[key]
             except Exception as e:
-                print(f"Failed to load adaptive thresholds: {e}")
+                logger.error(f"Failed to load adaptive thresholds: {e}")
                 
         return resolved

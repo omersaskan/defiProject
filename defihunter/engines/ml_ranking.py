@@ -11,6 +11,7 @@ from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.inspection import permutation_importance
 import warnings
+from defihunter.utils.logger import logger
 
 # Suppress sklearn 1.6+ cv='prefit' deprecation warnings to keep Streamlit / terminal logs clean
 warnings.filterwarnings('ignore', message=".*cv='prefit'.*", category=UserWarning)
@@ -49,30 +50,30 @@ class MLRankingEngine:
         BUG-C FIX: Normalizes regime strings before splitting (trend_* → TREND, chop/unstable → CHOP).
         """
         if combined_df.empty or 'regime' not in combined_df.columns:
-            print("Cannot perform global regime-aware training without 'regime' column.")
+            logger.warning("Cannot perform global regime-aware training without 'regime' column.")
             return False
         
         # GT-RANKING: Highest priority is cross-sectional ranking (Leader Prediction)
         if 'is_top3_family_next_24h' in combined_df.columns:
-            print("[ML] GT-RANKING: Using is_top3_family_next_24h as primary classifier (Family Leader)")
+            logger.info("[ML] GT-RANKING: Using is_top3_family_next_24h as primary classifier (Family Leader)")
             target_clf_col = 'is_top3_family_next_24h'
         elif 'is_top_decile_family_next_12h' in combined_df.columns:
-            print("[ML] GT-RANKING: Using is_top_decile_family_next_12h as primary classifier (Family Setup)")
+            logger.info("[ML] GT-RANKING: Using is_top_decile_family_next_12h as primary classifier (Family Setup)")
             target_clf_col = 'is_top_decile_family_next_12h'
         elif 'is_top3_overall' in combined_df.columns:
-            print("[ML] GT-RANKING: Using is_top3_overall as primary classifier (Leader Discovery)")
+            logger.info("[ML] GT-RANKING: Using is_top3_overall as primary classifier (Leader Discovery)")
             target_clf_col = 'is_top3_overall'
         elif 'target_early_big' in combined_df.columns:
-            print("[ML] GT-GOLD-2: Using target_early_big as primary (1h/1.5% + 24h/10% gainer)")
+            logger.info("[ML] GT-GOLD-2: Using target_early_big as primary (1h/1.5% + 24h/10% gainer)")
             target_clf_col = 'target_early_big'
         elif 'target_4h_2pct' in combined_df.columns:
-            print("[ML] GT-NEW-9: Using target_4h_2pct as primary classifier (fastest pre-pump signal)")
+            logger.info("[ML] GT-NEW-9: Using target_4h_2pct as primary classifier (fastest pre-pump signal)")
             target_clf_col = 'target_4h_2pct'
         elif 'prepump_target' in combined_df.columns:
-            print("[ML] GT #7: Using prepump_target as primary classifier (5%/24bar pre-pump signal)")
+            logger.info("[ML] GT #7: Using prepump_target as primary classifier (5%/24bar pre-pump signal)")
             target_clf_col = 'prepump_target'
             
-        print(f"Starting Global Multi-Asset Training on {len(combined_df)} total samples.")
+        logger.info(f"Starting Global Multi-Asset Training on {len(combined_df)} total samples.")
         
         # BUG-C FIX: Normalize regime labels before splitting
         combined_df = combined_df.copy()
@@ -81,17 +82,17 @@ class MLRankingEngine:
         df_trend = combined_df[combined_df['_regime_key'] == 'TREND'].sort_values('timestamp').reset_index(drop=True)
         df_chop  = combined_df[combined_df['_regime_key'] == 'CHOP'].sort_values('timestamp').reset_index(drop=True)
         
-        print(f"  Regime split → TREND: {len(df_trend)} rows | CHOP: {len(df_chop)} rows")
+        logger.info(f"  Regime split → TREND: {len(df_trend)} rows | CHOP: {len(df_chop)} rows")
         
         success_trend = False
         success_chop = False
         
         if len(df_trend) > 1000:
-            print("\n" + "="*50 + "\nEquipping GLOBAL_TREND Model\n" + "="*50)
+            logger.info("\n" + "="*50 + "\nEquipping GLOBAL_TREND Model\n" + "="*50)
             success_trend = self.train(df_trend, target_clf_col, target_short_col, target_reg_col, symbol="GLOBAL_TREND")
             
         if len(df_chop) > 1000:
-            print("\n" + "="*50 + "\nEquipping GLOBAL_CHOP Model\n" + "="*50)
+            logger.info("\n" + "="*50 + "\nEquipping GLOBAL_CHOP Model\n" + "="*50)
             success_chop = self.train(df_chop, target_clf_col, target_short_col, target_reg_col, symbol="GLOBAL_CHOP")
             
         return success_trend or success_chop
@@ -102,7 +103,7 @@ class MLRankingEngine:
         GT-REDESIGN: Now explicitly supports ranking targets for Leader Discovery.
         """
         if df_history.empty:
-            print("Insufficient data for ML training.")
+            logger.warning("Insufficient data for ML training.")
             return False
             
         # Determine targets
@@ -158,7 +159,7 @@ class MLRankingEngine:
         final_long_clf = None
         final_reg = None
         
-        print(f"[{symbol}] WF-CV ({n_splits} folds) | {len(X)} samples | {len(self.features_used)} features")
+        logger.info(f"[{symbol}] WF-CV ({n_splits} folds) | {len(X)} samples | {len(self.features_used)} features")
         
         for train_index, test_index in tscv.split(X):
             X_train, X_valid = X.iloc[train_index], X.iloc[test_index]
@@ -170,12 +171,17 @@ class MLRankingEngine:
                 num_pos = np.sum(y_train_long == 1)
                 spw_long = float(num_neg / num_pos) if num_pos > 0 else 1.0
                 
-                clf_long = lgb.LGBMClassifier(
-                    n_estimators=200, learning_rate=0.03, max_depth=6,
-                    subsample=0.8, colsample_bytree=0.8,
-                    scale_pos_weight=min(spw_long, 30.0),
-                    min_child_samples=20, n_jobs=4, random_state=42, verbose=-1
-                )
+                # Use params from config if available (via a hacky way since train() doesn't take config yet)
+                # In a real refactor, we'd pass config to __init__ and use it here.
+                # For now, let's keep it simple or assume defaults.
+                params = {
+                    "n_estimators": 200, "learning_rate": 0.03, "max_depth": 6,
+                    "subsample": 0.8, "colsample_bytree": 0.8,
+                    "scale_pos_weight": min(spw_long, 30.0),
+                    "min_child_samples": 20, "n_jobs": 4, "random_state": 42, "verbose": -1
+                }
+                
+                clf_long = lgb.LGBMClassifier(**params)
                 clf_long.fit(X_train, y_train_long, eval_set=[(X_valid, y_valid_long)], 
                              callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=False)])
                 
@@ -207,12 +213,12 @@ class MLRankingEngine:
                      final_reg = ranker
             
         if final_long_clf is None and final_reg is None:
-            print(f"Skipping {symbol}: Failed to complete valid CV folds.")
+            logger.warning(f"Skipping {symbol}: Failed to complete valid CV folds.")
             return False
             
         cv_long_auc = np.mean(long_auc_scores) if long_auc_scores else 0.5
         
-        print(f"[{symbol}] WF-CV Result -> Long AUC: {cv_long_auc:.4f} | Best Rank MSE: {best_mse_seen:.4f}")
+        logger.info(f"[{symbol}] WF-CV Result -> Long AUC: {cv_long_auc:.4f} | Best Rank MSE: {best_mse_seen:.4f}")
         
         self.long_clf_model = final_long_clf
         self.reg_model = final_reg
@@ -230,7 +236,7 @@ class MLRankingEngine:
         # Calculate permutation importance on the last validation fold
         # to get a true measure of feature value (resistant to cardinality bias)
         if final_long_clf is not None and 'X_valid' in locals() and 'y_valid_long' in locals():
-            print(f"[{symbol}] Stage 2 & 3: Calculating Permutation Importance...")
+            logger.info(f"[{symbol}] Stage 2 & 3: Calculating Permutation Importance...")
             try:
                 pi = permutation_importance(
                     final_long_clf,
@@ -250,14 +256,14 @@ class MLRankingEngine:
                         importances.append(float(imp_val))
                 
                 if len(valid_features) > 5:
-                    print(f"[{symbol}] Identified {len(valid_features)} important features via Permutation Importance.")
+                    logger.info(f"[{symbol}] Identified {len(valid_features)} important features via Permutation Importance.")
                     # Save the clean permutation dictionary
                     imp_dict = dict(zip(valid_features, importances))
                     joblib.dump(imp_dict, os.path.join(self.model_dir, f'feature_importance_{symbol}.pkl'))
                 else:
-                    print(f"[{symbol}] Permutation left too few features, skipping importance save.")
+                    logger.info(f"[{symbol}] Permutation left too few features, skipping importance save.")
             except Exception as e:
-                print(f"[{symbol}] Permutation importance failed: {e}")
+                logger.error(f"[{symbol}] Permutation importance failed: {e}")
 
         return True
 
@@ -270,11 +276,11 @@ class MLRankingEngine:
         3. Holdability Regressor: future_24h_rank_in_family (or pct)
         """
         if combined_df.empty:
-            print("[ML] Cannot train family-ranker on empty dataset.")
+            logger.warning("[ML] Cannot train family-ranker on empty dataset.")
             return False
             
-        print(f"\n{'='*50}\nTRAINING GLOBAL FAMILY-RANKER (DeFi Edition)\n{'='*50}")
-        print(f"Data Source: {len(combined_df)} master rows across multiple DeFi families.")
+        logger.info(f"\n{'='*50}\nTRAINING GLOBAL FAMILY-RANKER (DeFi Edition)\n{'='*50}")
+        logger.info(f"Data Source: {len(combined_df)} master rows across multiple DeFi families.")
         
         # Mapping targets from Patch 4
         t_leader = 'is_top3_family_next_24h'
@@ -282,15 +288,15 @@ class MLRankingEngine:
         t_hold   = 'future_24h_rank_in_family_pct' # Pct is more stable for regressor
         
         # 1/3 Train Leader Classifier
-        print(f"\n[1/3] Training Leader Classifier ({t_leader})...")
+        logger.info(f"\n[1/3] Training Leader Classifier ({t_leader})...")
         self.train(combined_df, target_clf_col=t_leader, symbol="FAMILY_LEADER")
         
         # 2/3 Train Setup Quality Classifier
-        print(f"\n[2/3] Training Setup Quality Classifier ({t_setup})...")
+        logger.info(f"\n[2/3] Training Setup Quality Classifier ({t_setup})...")
         self.train(combined_df, target_clf_col=t_setup, symbol="FAMILY_SETUP")
         
         # 3/3 Train Holdability Regressor
-        print(f"\n[3/3] Training Holdability Regressor ({t_hold})...")
+        logger.info(f"\n[3/3] Training Holdability Regressor ({t_hold})...")
         self.train(combined_df, target_reg_col=t_hold, symbol="FAMILY_HOLD")
         
         return True
@@ -305,7 +311,7 @@ class MLRankingEngine:
                 joblib.dump(obj, tmp_path)
                 os.replace(tmp_path, target_path)
             except Exception as e:
-                print(f"[ML-ERROR] Atomic save failed for {filename}: {e}")
+                logger.error(f"[ML-ERROR] Atomic save failed for {filename}: {e}")
 
         if self.long_clf_model:
             _atomic_dump(self.long_clf_model, f'lgb_classifier_long_{symbol}.pkl')
@@ -327,8 +333,9 @@ class MLRankingEngine:
             with open(tmp_meta, 'w') as f:
                 json.dump(meta, f, indent=2)
             os.replace(tmp_meta, meta_path)
-        except: pass
-        print(f"Models saved for {symbol}")
+        except Exception as e:
+            logger.error(f"[ML-ERROR] Atomic save failed for metadata_{symbol}.json: {e}")
+        logger.info(f"Models saved for {symbol}")
         self.active_symbol = symbol
         
     def load_family_ranker_models(self):
@@ -343,9 +350,10 @@ class MLRankingEngine:
             
             # Use features from leader (all three should use same pool)
             self.features_used = joblib.load(os.path.join(self.model_dir, 'features_used_FAMILY_LEADER.pkl'))
+            logger.info("[ML] Successfully loaded family-ranker suite.")
             return True
         except Exception as e:
-            print(f"[ML] Error loading family-ranker suite: {e}")
+            logger.error(f"[ML] Error loading family-ranker suite: {e}")
             return False
 
     def load_models(self, symbol="GLOBAL"):
@@ -386,7 +394,7 @@ class MLRankingEngine:
                                 break
                     
                     if healing_source:
-                        print(f"[ML] HEALING: {symbol} feature list was corrupted ({len(all_features)}). Restored from {cand} (127).")
+                        logger.info(f"[ML] HEALING: {symbol} feature list was corrupted ({len(all_features)}). Restored from {cand} (127).")
                         all_features = healing_source
                         joblib.dump(all_features, feat_path)
 
@@ -402,7 +410,7 @@ class MLRankingEngine:
                             # We keep track of top features for display/logging if needed, 
                             # but we do NOT change self.features_used used for X_pred
                             self.top_features_metasy = sorted(valid_imp, key=valid_imp.get, reverse=True)[:15]
-                            print(f"[ML] GT-GOLD-9: Identified top-15 features for {symbol}")
+                        pass
                     except Exception:
                         pass
 
@@ -472,7 +480,7 @@ class MLRankingEngine:
                         lambda r: f"[FAMILY_RANKER] Prob: {r['leader_prob']:.1%} | Setup: {r['setup_conversion_prob']:.1%} | Hold: {r['holdability_score']:.1f}", axis=1
                     )
                 except Exception as e:
-                    print(f"[ML-ERROR] Family-Ranker failed for {sym}: {e}")
+                    logger.error(f"[ML-ERROR] Family-Ranker failed for {sym}: {e}")
                     group['ml_rank_score'] = 50.0
                     use_family_ranker = False # Fallback
             
@@ -508,7 +516,7 @@ class MLRankingEngine:
                             lambda r: f"[{model_label}] RankProb: {r['ml_rank_score']:.1f} | PredRank: {r['future_rank_pct']:.1%}", axis=1
                         )
                     except Exception as e:
-                        print(f"[ML] Group Error ({sym}): {e}")
+                        logger.error(f"[ML] Group Error ({sym}): {e}")
                         group['ml_rank_score'] = 50.0
                         group['ml_explanation'] = f"ML Error ({sym})"
                 else:

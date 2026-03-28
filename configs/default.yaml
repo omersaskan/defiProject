@@ -93,6 +93,7 @@ risk:
   max_daily_loss_pct: 5.0
   max_open_positions: 5
   max_correlated_exposure: 2
+  default_leverage: 5.0
 
 backtest:
   fee_bps: 2.0
@@ -100,3 +101,61 @@ backtest:
   max_concurrent_positions: 5
   funding_costs_enabled: false
   time_stop_bars: 24
+
+# ── Family Participation & Execution Modes ─────────────────────────────────
+# stop_width_mult > 1 → wider stop, but position size shrinks proportionally
+# so net dollar risk stays constant (risk_amount = size × stop_pct = constant).
+family_execution:
+  defi_lending:
+    mode: trade_allowed
+    risk_pct_mult: 1.0
+    stop_width_mult: 1.0
+  defi_dex:
+    mode: trade_allowed
+    risk_pct_mult: 1.0
+    stop_width_mult: 1.0
+  defi_yield:
+    mode: trade_allowed
+    risk_pct_mult: 1.0
+    stop_width_mult: 1.0
+  defi_infra:
+    mode: trade_allowed
+    risk_pct_mult: 1.0
+    stop_width_mult: 1.0
+  defi_lst:
+    mode: trade_allowed
+    risk_pct_mult: 1.0
+    stop_width_mult: 1.0
+  defi_perp:
+    mode: reduced_risk
+    risk_pct_mult: 0.5
+    stop_width_mult: 1.3        # wider stop; size auto-shrinks (net risk unchanged)
+    min_entry_readiness: 70.0
+    min_leader_prob: 0.70
+    max_open_positions: 2
+  defi_oracles:
+    mode: watch_only             # scan + log + leader_capture, no trade opened
+    risk_pct_mult: 0.0
+    stop_width_mult: 1.0
+  defi_restaking:
+    mode: reduced_risk
+    risk_pct_mult: 0.5
+    stop_width_mult: 1.2
+    min_entry_readiness: 68.0
+    min_leader_prob: 0.65
+    max_open_positions: 2
+  defi_rwa:
+    mode: reduced_risk
+    risk_pct_mult: 0.5
+    stop_width_mult: 1.2
+    min_entry_readiness: 65.0
+    min_leader_prob: 0.60
+    max_open_positions: 2
+  defi_beta:
+    mode: reduced_risk
+    risk_pct_mult: 0.6
+    stop_width_mult: 1.1
+    min_entry_readiness: 65.0
+    min_leader_prob: 0.60
+    max_open_positions: 3
+

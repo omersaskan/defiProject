@@ -2,6 +2,7 @@ import ccxt
 import pandas as pd
 from typing import List, Dict, Optional
 import time
+from defihunter.utils.logger import logger
 
 class BinanceFuturesFetcher:
     def __init__(self):
@@ -31,14 +32,14 @@ class BinanceFuturesFetcher:
                     active_usdt.append(formatted_symbol)
             
             if not strict_defi:
-                print("[Fetcher] WARNING: Running in non-strict DEFI mode. Loading all active USDT-p symbols (Debug/Fallback).")
+                logger.warning("[Fetcher] Running in non-strict DEFI mode. Loading all active USDT-p symbols (Debug/Fallback).")
                 return active_usdt
 
             # 1. Higher priority: config.universe.defi_universe (Strict List)
             if config and hasattr(config.universe, 'defi_universe') and config.universe.defi_universe:
                 matched = [s for s in config.universe.defi_universe if s in active_usdt]
                 if not matched:
-                    print("[Fetcher] WARNING: Strict DeFi list provided but none are active USDT perps.")
+                    logger.warning("[Fetcher] Strict DeFi list provided but none are active USDT perps.")
                 return matched
             
             # 2. Lower priority: aggregate from families
@@ -52,13 +53,13 @@ class BinanceFuturesFetcher:
                 # Keep only members that are active on Binance
                 matched = list(set([s for s in defi_members if s in active_usdt]))
                 if not matched:
-                     print("[Fetcher] WARNING: Family members found but none are active USDT perps.")
+                     logger.warning("[Fetcher] Family members found but none are active USDT perps.")
                 return matched
                 
-            print(f"[Fetcher] WARNING: strict_defi is True but no whitelist found in config. Returning empty universe instead of scanning all altcoins.")
+            logger.warning(f"[Fetcher] strict_defi is True but no whitelist found in config. Returning empty universe instead of scanning all altcoins.")
             return []
         except Exception as e:
-            print(f"Error fetching markets: {e}")
+            logger.error(f"Error fetching markets: {e}")
             return []
 
     def _format_to_api(self, symbol: str) -> str:
@@ -98,7 +99,7 @@ class BinanceFuturesFetcher:
                 return pd.DataFrame()
             return pd.DataFrame(records).set_index('timestamp')
         except Exception as e:
-            print(f"[Fetcher] Could not fetch funding history for {symbol}: {e}")
+            logger.warning(f"[Fetcher] Could not fetch funding history for {symbol}: {e}")
             return pd.DataFrame()
 
     def fetch_open_interest_history(self, symbol: str, period: str = '1h', days: int = 180) -> pd.DataFrame:
@@ -158,7 +159,7 @@ class BinanceFuturesFetcher:
                     
                 time.sleep(self.exchange.rateLimit / 1000)
         except Exception as e:
-            print(f"[Fetcher] OI history not available for {symbol}: {e}")
+            logger.warning(f"[Fetcher] OI history not available for {symbol}: {e}")
             return pd.DataFrame()
         
         if not records:
@@ -185,7 +186,7 @@ class BinanceFuturesFetcher:
             else:
                 since = self.exchange.milliseconds() - (days * 24 * 60 * 60 * 1000)
             
-            print(f"Fetching historical {timeframe} data for {symbol} starting from {pd.to_datetime(since, unit='ms')}...")
+            logger.info(f"Fetching historical {timeframe} data for {symbol} starting from {pd.to_datetime(since, unit='ms')}...")
             
             while since < self.exchange.milliseconds():
                 ohlcv = self.exchange.fetch_ohlcv(api_symbol, timeframe, since=since, limit=1000)
@@ -234,7 +235,7 @@ class BinanceFuturesFetcher:
                 df['open_interest'] = oi_history['open_interest']
                 df['open_interest'] = df['open_interest'].ffill().bfill().fillna(0.0)
                 df = df.reset_index()
-                print(f"  [OI] Merged {len(oi_history)} historical OI records for {symbol}.")
+                logger.info(f"  [OI] Merged {len(oi_history)} historical OI records for {symbol}.")
             else:
                 # Fallback: use current OI as scalar (imperfect but better than error)
                 df['open_interest'] = 0.0
@@ -242,7 +243,7 @@ class BinanceFuturesFetcher:
                     oi_data = self.exchange.fetch_open_interest(api_symbol)
                     oi_val = oi_data.get('openInterestValue') or oi_data.get('baseVolume')
                     df['open_interest'] = float(oi_val) if oi_val is not None else 0.0
-                    print(f"  [OI] Using current snapshot OI for {symbol} (historical unavailable).")
+                    logger.info(f"  [OI] Using current snapshot OI for {symbol} (historical unavailable).")
                 except Exception:
                     pass
             
@@ -250,7 +251,7 @@ class BinanceFuturesFetcher:
             
             return df
         except Exception as e:
-            print(f"Error fetching historical OHLCV for {symbol}: {e}")
+            logger.error(f"Error fetching historical OHLCV for {symbol}: {e}")
             return pd.DataFrame()
 
     def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 500) -> pd.DataFrame:
@@ -313,7 +314,7 @@ class BinanceFuturesFetcher:
             
             return df
         except Exception as e:
-            print(f"Error fetching OHLCV for {symbol}: {e}")
+            logger.error(f"Error fetching OHLCV for {symbol}: {e}")
             return pd.DataFrame()
 
     def fetch_spot_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 100) -> pd.DataFrame:
@@ -333,7 +334,7 @@ class BinanceFuturesFetcher:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
         except Exception as e:
-            print(f"[Fetcher] Spot data not available for {symbol}: {e}")
+            logger.warning(f"[Fetcher] Spot data not available for {symbol}: {e}")
             return pd.DataFrame()
 
     def fetch_current_ticker(self, symbol: str) -> dict:

@@ -19,6 +19,7 @@ from defihunter.engines.entry import EntryEngine
 from defihunter.engines.family_aggregator import FamilyAggregator
 from defihunter.engines.decision import DecisionEngine
 from defihunter.engines.adaptive import AdaptiveWeightsEngine
+from defihunter.engines.adaptive_stop import AdaptiveStopEngine
 from defihunter.utils.logger import logger
 from defihunter.engines.exit_decay import ExitDecayEngine
 from defihunter.execution.paper_trade import PaperTradeEngine
@@ -28,32 +29,34 @@ from defihunter.data.features import compute_family_features
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from concurrent.futures import ThreadPoolExecutor
-
 def log_shadow(decisions, universe_size):
-    """GT #18: Shadow Verification Mode Logging."""
+    """Shadow Verification Mode Logging — uses top-level FinalDecision fields."""
     log_file = "logs/shadow_log.csv"
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     file_exists = os.path.exists(log_file)
-    
+
     with open(log_file, 'a', newline='') as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(['timestamp', 'evaluated_universe_size', 'symbol', 'family', 'discovery_score', 'entry_readiness', 'fakeout_risk', 'hold_quality', 'leader_prob', 'composite_leader_score', 'suggested_action'])
-        
+            writer.writerow([
+                'timestamp', 'evaluated_universe_size', 'symbol', 'family',
+                'discovery_score', 'entry_readiness', 'fakeout_risk', 'hold_quality',
+                'leader_prob', 'composite_leader_score', 'suggested_action',
+            ])
+
         for d in decisions:
             writer.writerow([
                 d.timestamp if hasattr(d, 'timestamp') and d.timestamp else datetime.now(pytz.utc).isoformat(),
                 universe_size,
                 d.symbol,
-                d.explanation.get('family', 'unknown'),
-                d.explanation.get('discovery_score', 0),
-                d.explanation.get('entry_readiness', 0),
-                d.explanation.get('fakeout_risk', 0),
-                d.explanation.get('hold_quality', 0),
-                d.explanation.get('leader_prob', 0),
-                d.final_trade_score,
-                d.decision
+                d.explanation.get('family', 'unknown'),  # family lives in explanation
+                d.discovery_score,
+                d.entry_readiness,
+                d.fakeout_risk,
+                d.hold_quality,
+                d.leader_prob,
+                d.composite_leader_score,
+                d.decision,
             ])
 
 def detect_momentum_cluster(rows: list) -> dict:
@@ -146,7 +149,7 @@ def load_false_signal_memory():
             with open(MEM_FILE, 'r') as f:
                 _false_signal_memory = json.load(f)
         except Exception as e:
-            print(f"[GT #17] Load memory failed: {e}")
+            logger.error(f"[GT #17] Load memory failed: {e}", exc_info=True)
 
 def save_false_signal_memory():
     """Save failure memory to disk."""
@@ -155,7 +158,7 @@ def save_false_signal_memory():
         with open(MEM_FILE, 'w') as f:
             json.dump(_false_signal_memory, f, indent=2)
     except Exception as e:
-        print(f"[GT #17] Save memory failed: {e}")
+        logger.error(f"[GT #17] Save memory failed: {e}", exc_info=True)
 
 
 def get_top_movers(fetcher, top_n: int = 30) -> list:
@@ -179,7 +182,7 @@ def get_top_movers(fetcher, top_n: int = 30) -> list:
         pre_pump.sort(key=lambda x: -x[1])
         return [s for s, _ in pre_pump[:top_n]]
     except Exception as e:
-        print(f"[GT #16] get_top_movers failed: {e}")
+        logger.error(f"[GT #16] get_top_movers failed: {e}")
         return []
 
 # GT #14: Behavior profile to numeric code
@@ -263,7 +266,7 @@ def run_scanner(config, force_regime=None, limit=0):
     
     # 1. Fetch TRUE MTF data for anchors
     anchor_mtf = {}
-    print("Fetching TRUE MTF context for anchors (BTC, ETH, AAVE, UNI)...")
+    logger.info("Fetching TRUE MTF context for anchors (BTC, ETH, AAVE, UNI)...")
     for anchor in config.anchors:
         anchor_mtf[anchor] = {}
         for tf in ['15m', '1h', '4h']:
@@ -277,15 +280,16 @@ def run_scanner(config, force_regime=None, limit=0):
     sector_engine = SectorRegimeEngine()
     family_engine = FamilyEngine(config)
     family_aggregator = FamilyAggregator(config.families)
-    discovery_engine = DiscoveryEngine(top_n=10)
-    entry_trigger_engine = EntryEngine(min_readiness=65)
-    decision_engine = DecisionEngine(top_n=5)
+    discovery_engine = DiscoveryEngine(top_n=getattr(config.decision, 'discovery_top_n', 10))
+    entry_trigger_engine = EntryEngine(min_readiness=getattr(config.decision, 'min_entry_readiness', 65))
+    decision_engine = DecisionEngine(top_n=getattr(config.decision, 'top_n', 5))
     leadership_engine = LeadershipEngine(anchors=config.anchors, ema_lengths=[config.ema.fast, config.ema.medium])
     adaptive_engine = AdaptiveWeightsEngine()
     
     
     decay_engine = ExitDecayEngine(config=config)
     paper_engine = PaperTradeEngine()
+    adaptive_stop_engine = AdaptiveStopEngine()
     risk_engine = RiskEngine(config.risk.dict(), fetcher=fetcher)
     broadcaster = SignalBroadcaster(config=config)
     
@@ -318,15 +322,15 @@ def run_scanner(config, force_regime=None, limit=0):
             perf_history = pd.read_csv(log_path)
             did_rollback = adaptive_engine.evaluate_and_rollback(perf_history)
             if did_rollback:
-                print("[ADAPTIVE] Performance degradation detected — rolled back to best known weights.")
+                logger.info("[ADAPTIVE] Performance degradation detected — rolled back to best known weights.")
             else:
                 # BUG #5 FIX: regime_label is now defined before this call
                 adaptive_weights = adaptive_engine.update_weights(perf_history, current_regime=regime_label)
-                print(f"[ADAPTIVE] Weights updated from {len(perf_history)} trade history records: {adaptive_weights}")
+                logger.info(f"[ADAPTIVE] Weights updated from {len(perf_history)} trade history records: {adaptive_weights}")
         except Exception as e:
-            print(f"[ADAPTIVE] Failed to process perf history: {e}. Using default weights.")
+            logger.error(f"[ADAPTIVE] Failed to process perf history: {e}. Using default weights.")
     else:
-        print("[ADAPTIVE] No performance log found. Using default weights.")
+        logger.info("[ADAPTIVE] No performance log found. Using default weights.")
 
     # 3. Evaluate Sector Regime
     sector_data = sector_engine.get_sector_regime(
@@ -355,17 +359,17 @@ def run_scanner(config, force_regime=None, limit=0):
     # BUG #4 FIX: Only slice/extend the already-fetched universe (no second API call)
     # GT #16: Get current top movers and prioritize them at start of scan list
     top_movers = get_top_movers(fetcher, top_n=30)
-    print(f"[GT #16] {len(top_movers)} pre-pump movers identified (1%-10% 24h change), scanning them first")
+    logger.info(f"[GT #16] {len(top_movers)} pre-pump movers identified (1%-10% 24h change), scanning them first")
     
     # GT-GOLD-3: RVR Pre-Scanner Filter + Anomaly Watchlist
     # Step 1: Get top-30 by volume anomaly (RVR — highest today vs 7d avg)
     from defihunter.data.universe import rank_by_relative_volume, build_anomaly_watchlist
     universe_limited = universe[:200]
-    print("[GT-GOLD-3] Running RVR pre-scan filter...")
+    logger.info("[GT-GOLD-3] Running RVR pre-scan filter...")
     rvr_top = rank_by_relative_volume(universe_limited, fetcher, timeframe='1h', lookback_bars=170, top_n=30)
     # Step 2: Build anomaly watchlist (fast multi-criteria filter)
     anomaly_qualified = build_anomaly_watchlist(rvr_top + top_movers + config.anchors, fetcher)
-    print(f"[GT-GOLD-3] Anomaly qualified: {len(anomaly_qualified)} coins after RVR+anomaly filter")
+    logger.info(f"[GT-GOLD-3] Anomaly qualified: {len(anomaly_qualified)} coins after RVR+anomaly filter")
     
     # Final scan list: anomaly_qualified first (most likely gainers), then rest of universe for completeness
     rest_of_universe = [s for s in universe_limited if s not in anomaly_qualified]
@@ -373,8 +377,6 @@ def run_scanner(config, force_regime=None, limit=0):
     watch_list = priority_set if not limit else priority_set[:limit]
         
         
-    logger.info(f"Scanning universe and computing layered logic for {timeframe}...")
-
     logger.info(f"Scanning universe and computing layered logic for {timeframe}...")
 
     symbol_data_map = {}
@@ -405,12 +407,12 @@ def run_scanner(config, force_regime=None, limit=0):
             logger.error(f"Error fetching {symbol}: {e}")
 
     max_workers = min(os.cpu_count() * 2, 20)
-    print(f"[Phase 1] Parallelizing data fetch with {max_workers} workers...")
+    logger.info(f"[Phase 1] Parallelizing data fetch with {max_workers} workers...")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(fetch_and_prep, watch_list)
 
     # PHASE 2: Global Family Aggregation
-    print("[Phase 2] Computing Global Family Aggregates...")
+    logger.info("[Phase 2] Computing Global Family Aggregates...")
     family_stats = family_aggregator.compute_family_stats(symbol_data_map, timeframe=timeframe)
     
     # PHASE 3: Parallel Logic Evaluation (Rules, Decay, Ranking)
@@ -443,6 +445,9 @@ def run_scanner(config, force_regime=None, limit=0):
                 "symbol": symbol,
                 "family": profile.family_label,
                 "regime": regime_label,
+                # Carry raw ATR and current close from last bar for adaptive stop
+                "_atr": float(df.iloc[-1].get('atr', 0.0)),
+                "_close_raw": float(df.iloc[-1].get('close', 0.0)),
             })
             with rows_lock:
                 all_rows.append(last_bar)
@@ -457,7 +462,7 @@ def run_scanner(config, force_regime=None, limit=0):
     master_df = pd.DataFrame(all_rows)
             
     if master_df.empty:
-        print("No candidates found in current scan.")
+        logger.info("No candidates found in current scan.")
         return []
 
     # --- LAYERED PIPELINE CONTINUES ---
@@ -467,11 +472,11 @@ def run_scanner(config, force_regime=None, limit=0):
     master_df = compute_family_features(master_df)
     
     # 4. ML Leader Components
-    print("\n[ML] Predicting Leader Prob, Setup Quality, and Holdability...")
+    logger.info("\n[ML] Predicting Leader Prob, Setup Quality, and Holdability...")
     master_df, _ = ml_engine.rank_candidates(master_df, use_family_ranker=True) 
     
     # 5. Discovery Layer
-    print("[Discovery] Identifying leader candidates...")
+    logger.info("[Discovery] Identifying leader candidates...")
     master_df = discovery_engine.compute_discovery_scores(master_df)
     
     # 6. Entry & Decision Layer
@@ -485,61 +490,206 @@ def run_scanner(config, force_regime=None, limit=0):
     paper_engine.update_positions(current_market_prices, decay_signals=decay_signals)
 
     # 7. RISK FILTERING & Execution
-    executed_decisions = []
-    for d in final_decisions:
-        current_portfolio_list = [p.dict() for p in paper_engine.portfolio.open_positions]
+    # 7. RISK FILTERING & Execution
+executed_decisions = []
+
+# GT #18: Daily Loss Killswitch Wiring
+daily_loss_pct = paper_engine.get_daily_loss_pct()
+
+for d in final_decisions:
+    current_portfolio_list = [p.dict() for p in paper_engine.portfolio.open_positions]
+
+    if d.decision == 'trade':
+        family_label = d.explanation.get('family', 'defi_beta')
+
+        # ── Family Execution Mode ──────────────────────────────────────
+        exec_cfg   = config.get_family_execution(family_label) if hasattr(config, 'get_family_execution') else None
+        exec_mode  = getattr(exec_cfg, 'mode', 'trade_allowed') if exec_cfg else 'trade_allowed'
+        width_mult = getattr(exec_cfg, 'stop_width_mult', 1.0) if exec_cfg else 1.0
+
+        # watch_only: log to shadow, skip trade
+        if exec_mode == 'watch_only':
+            logger.info(f"[WatchOnly] {d.symbol} ({family_label}) — candidate logged, no trade opened")
+            d.explanation['participation_mode'] = 'watch_only'
+            executed_decisions.append(d)
+            continue
+
+        # ── Kelly first ───────────────────────────────────────────────
+        win_prob = d.leader_prob if d.leader_prob > 0 else 0.5
+        kelly_pct = risk_engine.calculate_kelly_size(
+            win_prob=win_prob,
+            reward_risk=2.0,
+            leader_prob=d.leader_prob
+        )
+
+        # reduced_risk: apply gates BEFORE risk validation
+        if exec_cfg and exec_mode == 'reduced_risk':
+            min_er  = getattr(exec_cfg, 'min_entry_readiness', 0.0)
+            min_lp  = getattr(exec_cfg, 'min_leader_prob', 0.0)
+            max_pos = getattr(exec_cfg, 'max_open_positions', 5)
+
+            family_open = sum(
+                1 for p in paper_engine.portfolio.open_positions
+                if p.family == family_label
+            )
+
+            if d.entry_readiness < min_er:
+                d.decision = 'reject'
+                d.explanation['rejection_reason'] = (
+                    f'reduced_risk: entry_readiness {d.entry_readiness:.1f} < {min_er}'
+                )
+                executed_decisions.append(d)
+                continue
+
+            if d.leader_prob < min_lp:
+                d.decision = 'reject'
+                d.explanation['rejection_reason'] = (
+                    f'reduced_risk: leader_prob {d.leader_prob:.2f} < {min_lp}'
+                )
+                executed_decisions.append(d)
+                continue
+
+            if family_open >= max_pos:
+                d.decision = 'reject'
+                d.explanation['rejection_reason'] = (
+                    f'reduced_risk: {family_label} already has {family_open}/{max_pos} positions'
+                )
+                executed_decisions.append(d)
+                continue
+
+            risk_pct_mult = getattr(exec_cfg, 'risk_pct_mult', 1.0)
+            kelly_pct *= risk_pct_mult
+
+        d.explanation['participation_mode'] = exec_mode
+
+        # ── Adaptive Stop ─────────────────────────────────────────────
+        adaptive_stop_result = None
+        try:
+            sym_rows  = master_df[master_df['symbol'] == d.symbol]
+            atr_val   = float(sym_rows['_atr'].iloc[-1]) if '_atr' in sym_rows.columns and not sym_rows.empty else 0.0
+            close_val = float(sym_rows['_close_raw'].iloc[-1]) if '_close_raw' in sym_rows.columns and not sym_rows.empty else d.entry_price
+
+            stop_row = {
+                'close':         close_val,
+                'atr':           atr_val,
+                'structure_low': float(sym_rows.get('structure_low', pd.Series([0.0])).iloc[-1]) if 'structure_low' in sym_rows.columns else 0.0,
+                'swing_low':     float(sym_rows.get('swing_low', pd.Series([0.0])).iloc[-1]) if 'swing_low' in sym_rows.columns else 0.0,
+                'support_level': float(sym_rows.get('support_level', pd.Series([0.0])).iloc[-1]) if 'support_level' in sym_rows.columns else 0.0,
+            }
+
+            adaptive_stop_result = adaptive_stop_engine.compute_stop(
+                row=stop_row,
+                family=family_label,
+                regime=regime_label,
+                fakeout_risk=d.fakeout_risk,
+                stop_width_mult=width_mult,
+            )
+
+            # Wider stop -> smaller % risk to keep net dollar risk sane
+            if width_mult > 1.0:
+                kelly_pct /= width_mult
+
+            logger.info(
+                f"[AdaptiveStop-V2] {d.symbol} | "
+                f"mode={exec_mode} | "
+                f"stop_mode={adaptive_stop_result['stop_mode']} | "
+                f"atr_mult={adaptive_stop_result['atr_mult']} | "
+                f"family={family_label} | regime={regime_label} | "
+                f"hard_stop={adaptive_stop_result['stop_price']:.6f} | "
+                f"soft_stop={adaptive_stop_result['soft_invalidation_price']:.6f} | "
+                f"tp1={adaptive_stop_result['tp1_price']:.6f} | "
+                f"confidence={adaptive_stop_result.get('stop_confidence', '?')} | "
+                f"noise_bars={adaptive_stop_result.get('noise_tolerance_bars', '?')} | "
+                f"reduce_size_first={adaptive_stop_result.get('reduce_size_first', False)}"
+            )
+        except Exception as _stop_err:
+            logger.warning(
+                f"[AdaptiveStop-V2] compute_stop failed for {d.symbol}: {_stop_err} — using legacy fallback",
+                exc_info=True
+            )
+            adaptive_stop_result = None
+
+        # ── Determine stop price for sizing ──────────────────────────
+        stop_price_for_sizing = (
+            adaptive_stop_result["stop_price"]
+            if adaptive_stop_result and adaptive_stop_result.get("stop_price")
+            else d.stop_price
+        )
+
+        # ── Estimate REAL notional from risk + stop distance ────────
+        actual_notional = risk_engine.estimate_notional_from_stop(
+            equity_val=paper_engine.portfolio.balance_usd,
+            risk_pct=kelly_pct,
+            entry_price=d.entry_price,
+            stop_price=stop_price_for_sizing,
+        )
+
+        if actual_notional <= 0:
+            d.decision = 'reject'
+            d.explanation['rejection_reason'] = 'invalid_sizing_notional'
+            executed_decisions.append(d)
+            continue
+
+        d.explanation['kelly_risk_pct'] = kelly_pct
+        d.explanation['estimated_notional'] = actual_notional
+
+        # ── NOW run risk validation with REAL values ────────────────
         is_valid, reason = risk_engine.validate_trade(
             symbol=d.symbol,
-            family=d.explanation.get('family', 'beta'),
+            family=family_label,
             current_portfolio=current_portfolio_list,
             equity_val=paper_engine.portfolio.balance_usd,
-            daily_loss_pct=0.0
+            daily_loss_pct=daily_loss_pct,   # TODO: wire real daily loss
+            leader_prob=d.leader_prob,
+            new_trade_notional=actual_notional,
+            leverage=getattr(config.risk, "default_leverage", None),
         )
-        
-        if is_valid:
-            win_prob = d.explanation.get('leader_prob', 0.5)
-            # Simplified Risk/Reward for Kelly sizing
-            kelly_pct = risk_engine.calculate_kelly_size(win_prob, 2.0)
-            d.explanation['kelly_risk_pct'] = kelly_pct
 
-            if d.decision == 'trade':
-                paper_engine.open_position(d, risk_pct=kelly_pct)
-        else:
-            if d.decision == 'trade':
-               d.decision = "reject"
-               d.explanation['rejection_reason'] = reason
+        if not is_valid:
+            d.decision = 'reject'
+            d.explanation['rejection_reason'] = reason
+            executed_decisions.append(d)
+            continue
 
-        executed_decisions.append(d)
-            
+        # Optional: persist leverage info for future portfolio margin calc
+        d.explanation['leverage'] = getattr(config.risk, "default_leverage", None)
+
+        paper_engine.open_position(
+            d,
+            risk_pct=kelly_pct,
+            adaptive_stop_result=adaptive_stop_result
+        )
+
+    executed_decisions.append(d)     
     # DISPLAY NEW LEADERBOARD
     display_rows = []
     for d in executed_decisions:
         display_rows.append({
-            "Symbol": d.symbol,
-            "Family": d.explanation.get('family', '—'),
-            "Disc_S": round(d.explanation.get('discovery_score', 0), 1),
-            "Ready_S": round(d.explanation.get('entry_readiness', 0), 1),
-            "Risk_F": round(d.explanation.get('fakeout_risk', 0), 1),
-            "Hold_Q": round(d.explanation.get('hold_quality', 0), 1),
-            "L_Prob": f"{d.explanation.get('leader_prob', 0)*100:.0f}%",
-            "Comp_S": round(d.final_trade_score, 1),
-            "Action": d.decision,
-            "Entry": round(d.entry_price, 4),
-            "Timestamp": d.timestamp.strftime('%H:%M:%S') if d.timestamp else '—'
+            "Symbol":    d.symbol,
+            "Family":    d.explanation.get('family', '—'),
+            "Disc_S":    round(d.discovery_score, 1),
+            "Ready_S":   round(d.entry_readiness, 1),
+            "Risk_F":    round(d.fakeout_risk, 1),
+            "Hold_Q":    round(d.hold_quality, 1),
+            "L_Prob":    f"{d.leader_prob * 100:.0f}%",
+            "Comp_S":    round(d.composite_leader_score, 1),
+            "Action":    d.decision,
+            "Entry":     round(d.entry_price, 4),
+            "Timestamp": d.timestamp.strftime('%H:%M:%S') if d.timestamp else '—',
         })
         
     final_display_df = pd.DataFrame(display_rows)
-    print("\n[PHASE 5: LAYERED DECISION ENGINE ACTIVE]")
+    logger.info("\n[PHASE 5: LAYERED DECISION ENGINE ACTIVE]")
     if not final_display_df.empty:
-        print(final_display_df.sort_values('Comp_S', ascending=False).to_markdown(index=False))
+        logger.info("\n" + final_display_df.sort_values('Comp_S', ascending=False).to_markdown(index=False))
     
-    print(f"\n[PAPER PORTFOLIO] Balance: ${paper_engine.portfolio.balance_usd:.2f} | Open: {len(paper_engine.portfolio.open_positions)}")
+    logger.info(f"\n[PAPER PORTFOLIO] Balance: ${paper_engine.portfolio.balance_usd:.2f} | Open: {len(paper_engine.portfolio.open_positions)}")
     
     # BROADCAST ALERTS
     try:
         broadcaster.broadcast(executed_decisions)
     except Exception as e:
-        print(f"[Broadcaster] Error during signal broadcast: {e}")
+        logger.error(f"[Broadcaster] Error during signal broadcast: {e}")
     
     save_false_signal_memory()
     return executed_decisions

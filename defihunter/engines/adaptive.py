@@ -4,6 +4,7 @@ import pandas as pd
 from typing import Dict, Any, List
 import numpy as np
 from datetime import datetime
+from defihunter.utils.logger import logger
 
 class AdaptiveWeightsEngine:
     def __init__(self, persistence_path: str = "configs/adaptive_weights.yaml"):
@@ -36,7 +37,7 @@ class AdaptiveWeightsEngine:
                         # Legacy format support
                         self.current_weights = data
                         self.snapshots = []
-                print(f"Loaded adapted weights: {self.current_weights} and thresholds: {self.current_thresholds}")
+                logger.info(f"Loaded adapted weights: {self.current_weights} and thresholds: {self.current_thresholds}")
 
     def save_weights(self):
         data = {
@@ -76,7 +77,7 @@ class AdaptiveWeightsEngine:
             self.snapshots  = sorted(protected + recent_others, key=lambda s: s['timestamp'])
 
         self.save_weights()
-        print(f"Snapshot saved. Total snapshots: {len(self.snapshots)}")
+        logger.info(f"Snapshot saved. Total snapshots: {len(self.snapshots)}")
 
     def evaluate_and_rollback(self, performance_history: pd.DataFrame) -> bool:
         """
@@ -92,7 +93,7 @@ class AdaptiveWeightsEngine:
         
         # Degradation criteria: very low win rate OR high negative expectancy
         if win_rate < 0.30 or expectancy < -0.3:
-            print(f"Performance Degradation Detected! Win Rate: {win_rate:.2%}, Expectancy: {expectancy:.2f}R")
+            logger.warning(f"Performance Degradation Detected! Win Rate: {win_rate:.2%}, Expectancy: {expectancy:.2f}R")
             
             if self.snapshots:
                 # Find the most recent snapshot where expectancy was positive
@@ -101,10 +102,10 @@ class AdaptiveWeightsEngine:
                 
                 if valid_snapshots:
                     best_snapshot = valid_snapshots[-1]
-                    print(f"Rolling back to good snapshot from {best_snapshot['timestamp']}")
+                    logger.info(f"Rolling back to good snapshot from {best_snapshot['timestamp']}")
                 else:
                     best_snapshot = self.snapshots[0]
-                    print("No purely positive snapshots found. Rolling back to oldest available state.")
+                    logger.info("No purely positive snapshots found. Rolling back to oldest available state.")
                     
                 self.current_weights = best_snapshot['weights'].copy()
                 self.current_thresholds = best_snapshot.get('thresholds', self.current_thresholds).copy()
@@ -116,7 +117,7 @@ class AdaptiveWeightsEngine:
                 self.save_weights()
                 return True
             else:
-                print("Degradation detected but no snapshots available for rollback. Resetting to default.")
+                logger.info("Degradation detected but no snapshots available for rollback. Resetting to default.")
                 self.current_weights = {
                     "trend_score": 1.0,
                     "expansion_score": 1.0,

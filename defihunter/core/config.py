@@ -1,7 +1,8 @@
 import yaml
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Literal
 from pathlib import Path
+from defihunter.utils.logger import logger
 
 class DataConfig(BaseModel):
     timeframes: List[str] = ["15m", "1h", "4h"]
@@ -41,9 +42,14 @@ class RegimeOverrides(BaseModel):
     max_spread_bps: Optional[float] = None
 
 class RegimeConfig(BaseModel):
-    min_volume: float = 1_000_000.0
+    min_volume: float = 10_000_000.0
     min_oi: float = 500_000.0
     max_spread_bps: float = 15.0
+    min_score: int = 50
+    min_relative_leadership: int = 0
+    breakout_buffer_atr: float = 0.5
+    retest_tolerance_atr: float = 0.3
+    time_stop_bars: int = 24
     overrides: Dict[str, RegimeOverrides] = Field(default_factory=dict)
     
 class FamilyConfigItem(BaseModel):
@@ -63,6 +69,26 @@ class RiskConfig(BaseModel):
     liquidation_buffer: float = 0.20
     max_avg_correlation: float = 0.70
     kelly_fraction: float = 0.25
+    default_leverage: float = 5.0
+
+
+PARTICIPATION_MODE = Literal["trade_allowed", "reduced_risk", "watch_only"]
+
+
+class FamilyExecutionConfig(BaseModel):
+    """
+    Per-family execution gate and risk parameters.
+
+    stop_width_mult: multiplier applied to stop distance (e.g. 1.3 = 30% wider stop).
+    IMPORTANT: when stop_width_mult > 1, position size is proportionally reduced so
+    net dollar risk (= size_usd × stop_pct) stays constant.
+    """
+    mode:                  PARTICIPATION_MODE = "trade_allowed"
+    risk_pct_mult:         float = 1.0    # multiply base kelly% by this
+    stop_width_mult:       float = 1.0    # widen stop; size shrinks proportionally
+    min_entry_readiness:   float = 0.0    # extra gate for reduced_risk
+    min_leader_prob:       float = 0.0    # extra gate for reduced_risk
+    max_open_positions:    int   = 5      # per-family position cap
 
 class AlertConfig(BaseModel):
     telegram_token: Optional[str] = None
@@ -72,12 +98,22 @@ class LabelingConfig(BaseModel):
     primary_target: str = "is_top3_family_next_24h"
     horizon_hours: int = 24
 
+class DecisionConfig(BaseModel):
+    use_layered_logic: bool = True
+    top_n: int = 5
+    discovery_top_n: int = 10
+    min_entry_readiness: float = 65.0
+
 class TrainingConfig(BaseModel):
     primary_objective: str = "family_ranker"
     fallback_legacy: bool = False
-
-class DecisionConfig(BaseModel):
-    use_layered_logic: bool = True
+    lgbm_params: Dict[str, Any] = Field(default_factory=lambda: {
+        "n_estimators": 200,
+        "learning_rate": 0.03,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8
+    })
 
 class ExitConfig(BaseModel):
     enable_leadership_decay: bool = True
@@ -91,6 +127,7 @@ class AppConfig(BaseModel):
     ema: EmaConfig = Field(default_factory=EmaConfig)
     regimes: RegimeConfig = Field(default_factory=RegimeConfig)
     families: Dict[str, FamilyConfigItem] = Field(default_factory=dict)
+    family_execution: Dict[str, FamilyExecutionConfig] = Field(default_factory=dict)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
@@ -98,7 +135,11 @@ class AppConfig(BaseModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
     exit: ExitConfig = Field(default_factory=ExitConfig)
-    
+
+    def get_family_execution(self, family: str) -> FamilyExecutionConfig:
+        """Return FamilyExecutionConfig for a family, defaulting to trade_allowed."""
+        return self.family_execution.get(family, FamilyExecutionConfig())
+
 def load_config(path: str | Path) -> AppConfig:
     with open(path, 'r') as f:
         data = yaml.safe_load(f)
@@ -108,12 +149,23 @@ def load_config(path: str | Path) -> AppConfig:
     if groups_path.exists():
         with open(groups_path, 'r') as f:
             groups_data = yaml.safe_load(f)
-            
-            families_data = {k: v for k, v in groups_data.items() if k != 'universe_filters'}
+
+            # Fix #1: Defensive merge — sadece geçerli FamilyConfigItem yapısına sahip
+            # girişleri al; malformed olanları sessizce geçirme, uyar.
+            families_data = {}
+            for k, v in groups_data.items():
+                if k == 'universe_filters':
+                    continue
+                if isinstance(v, dict) and 'primary_anchor' in v and 'members' in v:
+                    families_data[k] = v
+                else:
+                    logger.warning(f"[CONFIG WARN] universe_groups.yaml — malformed family entry skipped: '{k}' "
+                                   f"(primary_anchor veya members eksik)")
+
             if families_data:
                 data['families'] = {**data.get('families', {}), **families_data}
-                
+
             if 'universe_filters' in groups_data:
                 data['universe'] = {**data.get('universe', {}), **groups_data['universe_filters']}
-                
+
     return AppConfig(**data)

@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+from defihunter.utils.logger import logger
 from pathlib import Path
 from typing import Optional
 
@@ -41,10 +42,11 @@ class TSDBManager:
             else:
                 # Save fresh
                 df = df.reset_index(drop=True)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
                 df.to_parquet(path, compression='snappy', engine='pyarrow')
             return True
         except Exception as e:
-            print(f"Error saving to TSDB Parquet: {e}")
+            logger.error(f"Error saving to TSDB Parquet for {symbol}: {e}")
             return False
 
     def load_dataframe(self, symbol: str, timeframe: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
@@ -71,7 +73,7 @@ class TSDBManager:
             df = pd.read_parquet(path, engine='pyarrow', **kwargs)
             return df
         except Exception as e:
-            print(f"Error reading TSDB Parquet: {e}")
+            logger.error(f"Error reading TSDB Parquet for {symbol}: {e}")
             return pd.DataFrame()
 
     def get_latest_timestamp(self, symbol: str, timeframe: str) -> Optional[pd.Timestamp]:
@@ -79,15 +81,15 @@ class TSDBManager:
         Quickly reads the last timestamp in the Parquet file to know where to resume fetching.
         """
         path = self._get_path(symbol, timeframe)
-        if not path.exists():
+        if not path or not path.exists():
             return None
             
         try:
-            # We just read the timestamp column to keep memory very low, then get max
+            # We just read the timestamp column to keep memory footprint low
             df = pd.read_parquet(path, columns=['timestamp'], engine='pyarrow')
             if not df.empty:
                 return df['timestamp'].max()
             return None
         except Exception as e:
-            print(f"Error fetching latest TSDB timestamp: {e}")
+            logger.error(f"Error fetching latest TSDB timestamp for {symbol}: {e}")
             return None

@@ -180,3 +180,6 @@ test_results_leader.log
 /models/*.pkl
 /models/*.h5
 /models/*.onnx
+data/
+models_15m/
+reports/

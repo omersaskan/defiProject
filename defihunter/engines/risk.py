@@ -1,3 +1,5 @@
+from typing import Optional
+
 class RiskEngine:
     def __init__(self, config: dict, fetcher=None):
         self.max_open_positions = config.get("max_open_positions", 5)
@@ -7,87 +9,152 @@ class RiskEngine:
         self.liquidation_buffer = config.get("liquidation_buffer", 0.20)
         self.max_avg_correlation = config.get("max_avg_correlation", 0.70)
         self.kelly_fraction = config.get("kelly_fraction", 0.25)
-        
+        self.default_leverage = config.get("default_leverage", 5.0)
+
         from defihunter.engines.portfolio import CorrelationEngine
-        # Bug #6 Fix: Accept shared fetcher via DI instead of always creating a new one
         if fetcher is None:
             from defihunter.data.binance_fetcher import BinanceFuturesFetcher
             fetcher = BinanceFuturesFetcher()
         self.corr_engine = CorrelationEngine(fetcher=fetcher)
-        
-    def calculate_kelly_size(self, win_prob: float, reward_risk: float, leader_prob: float = 0.5) -> float:
+
+    def calculate_kelly_size(
+        self,
+        win_prob: float,
+        reward_risk: float,
+        leader_prob: float = 0.5
+    ) -> float:
         """
-        GT-REDESIGN: Leadership-Aware Kelly Sizing.
-        Scales the base Kelly fraction up if the coin is a high-probability family leader.
+        Leadership-aware fractional Kelly.
+        Returns risk percentage of equity (0..max_risk_per_trade_pct).
         """
         if reward_risk <= 0 or win_prob <= 0 or win_prob >= 1:
             return 0.0
-            
+
         kelly_perc = win_prob - ((1.0 - win_prob) / reward_risk)
-        
-        # Leader Multiplier: Max conviction on clear leaders (prob > 0.8)
-        leader_multiplier = 1.0 + (max(0, leader_prob - 0.5) * 1.5)
+        leader_multiplier = 1.0 + (max(0.0, leader_prob - 0.5) * 1.5)
         fractional_kelly = kelly_perc * self.kelly_fraction * leader_multiplier
-        
-        final_risk_pct = min(max(fractional_kelly * 100.0, 0.0), self.max_risk_per_trade_pct)
+
+        final_risk_pct = min(
+            max(fractional_kelly * 100.0, 0.0),
+            self.max_risk_per_trade_pct
+        )
         return final_risk_pct
 
-    def validate_trade(self,
-                     symbol: str, 
-                     family: str, 
-                     current_portfolio: list[dict],
-                     equity_val: float,
-                     daily_loss_pct: float,
-                     leader_prob: float = 0.5) -> tuple[bool, str]:
+    def estimate_notional_from_stop(
+        self,
+        equity_val: float,
+        risk_pct: float,
+        entry_price: float,
+        stop_price: float
+    ) -> float:
         """
-        GT-REDESIGN: Dynamic Position Manager with Leadership awareness.
+        Convert desired % equity risk into actual notional using stop distance.
+
+        Example:
+            equity = 10,000
+            risk_pct = 1.0
+            entry = 100
+            stop = 95  -> 5% stop distance
+            risk_usd = 100
+            notional = 100 / 0.05 = 2000
         """
+        if equity_val <= 0 or risk_pct <= 0 or entry_price <= 0 or stop_price <= 0:
+            return 0.0
+
+        stop_distance_pct = abs(entry_price - stop_price) / entry_price
+        if stop_distance_pct <= 0:
+            return 0.0
+
+        risk_usd = equity_val * (risk_pct / 100.0)
+        notional = risk_usd / stop_distance_pct
+        return max(notional, 0.0)
+
+    def validate_trade(
+        self,
+        symbol: str,
+        family: str,
+        current_portfolio: list[dict],
+        equity_val: float,
+        daily_loss_pct: float,
+        leader_prob: float,
+        new_trade_notional: Optional[float],
+        leverage: Optional[float] = None,
+    ) -> tuple[bool, str]:
+        """
+        Dynamic Position Manager with leadership awareness.
+
+        IMPORTANT:
+        new_trade_notional must be the ACTUAL size derived from Kelly + stop distance.
+        """
+        from defihunter.utils.logger import logger
+
+        if equity_val <= 0:
+            return False, "invalid_equity"
+
+        if new_trade_notional is None or new_trade_notional <= 0:
+            return False, "invalid_trade_notional"
+
+        effective_leverage = leverage or self.default_leverage
+        if effective_leverage <= 0:
+            return False, "invalid_leverage"
+
         # Rule: Max open positions
         if len(current_portfolio) >= self.max_open_positions:
             return False, "max_open_positions_reached"
-            
-        # Rule: Dynamic same-family exposure based on Leadership conviction
+
+        # Rule: Dynamic same-family exposure based on conviction
         allowed_exposure = self.max_correlated_exposure
         if leader_prob > 0.80:
-            allowed_exposure += 1  # Allow one more if it's a very clear leader
-            
-        same_family_exposure = sum(1 for pos in current_portfolio if pos.get('family') == family)
+            allowed_exposure += 1
+
+        same_family_exposure = sum(
+            1 for pos in current_portfolio if pos.get("family") == family
+        )
         if same_family_exposure >= allowed_exposure:
             return False, f"max_family_exposure_reached ({allowed_exposure})"
-            
+
         # Rule: Daily Loss Killswitch
         if daily_loss_pct <= -self.max_daily_loss_pct:
             return False, "max_daily_loss_exceeded"
-            
+
         # Rule: No averaging down / duplicated symbols
-        existing_symbols = [pos.get('symbol') for pos in current_portfolio]
+        existing_symbols = [pos.get("symbol") for pos in current_portfolio]
         if symbol in existing_symbols:
             return False, "already_in_position_no_averaging_down"
-            
-        # Rule: Correlation Multiplier (Advanced)
+
+        # Rule: Correlation
         if existing_symbols:
             try:
                 corr_data = self.corr_engine.calculate_correlation(symbol, existing_symbols)
-                if corr_data.get('mean_corr', 0) > self.max_avg_correlation:
-                    return False, f"high_portfolio_correlation ({corr_data.get('mean_corr', 0):.2f})"
+                mean_corr = corr_data.get("mean_corr", 0.0)
+                if mean_corr > self.max_avg_correlation:
+                    return False, f"high_portfolio_correlation ({mean_corr:.2f})"
             except Exception as e:
-                # If correlation engine fails or is missing historical data, fallback to strict family limits
-                pass
-        # Margin required = sum(notional_size / leverage)
-        # We assume a default leverage of 5.0 for DeFi perps
-        assumed_leverage = 5.0
-        current_margin_usd = sum(pos.get('size_usd', 0) / assumed_leverage for pos in current_portfolio)
-        
-        # New trade potential notional (simplified $1000 size for demo)
-        new_trade_notional = 1000.0
-        new_margin_req = new_trade_notional / assumed_leverage
-        
+                logger.error(
+                    f"Correlation engine CRITICAL error for {symbol}: {e}. "
+                    f"Vetoing trade for safety.",
+                    exc_info=True
+                )
+                return False, "correlation_engine_error"
+
+        # Margin required = sum(notional / leverage)
+        current_margin_usd = 0.0
+        for pos in current_portfolio:
+            pos_size = float(pos.get("size_usd", 0.0) or 0.0)
+            pos_leverage = float(pos.get("leverage", effective_leverage) or effective_leverage)
+            if pos_leverage <= 0:
+                pos_leverage = effective_leverage
+            current_margin_usd += pos_size / pos_leverage
+
+        new_margin_req = new_trade_notional / effective_leverage
         total_margin_req = current_margin_usd + new_margin_req
-        
-        # Max margin utilization (80% of equity to leave 20% buffer)
+
+        # Leave liquidation buffer
         max_margin = equity_val * (1.0 - self.liquidation_buffer)
-        
         if total_margin_req > max_margin:
-            return False, f"insufficient_margin_buffer (using {total_margin_req:.1f}$ of max {max_margin:.1f}$)"
-            
+            return False, (
+                f"insufficient_margin_buffer "
+                f"(using {total_margin_req:.1f}$ of max {max_margin:.1f}$)"
+            )
+
         return True, ""

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from defihunter.engines.family_aggregator import FamilyAggregator
 from defihunter.core.config import AppConfig
 from defihunter.utils.timeframe import TimeframeHelper
+from defihunter.utils.logger import logger
 
 
 class DatasetBuilder:
@@ -192,24 +193,16 @@ class DatasetBuilder:
         from defihunter.data.features import compute_family_features
         return compute_family_features(combined)
 
-    def build(self, df: pd.DataFrame, is_multi: bool = False, timeframe: str = '15m') -> pd.DataFrame:
+    def build(self, df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
         """
         Public alias for label generation and sector feature injection.
         """
-        if not is_multi:
-            return self.generate_labels(df)
-        else:
-            # 1. First generate individual labels (for return_24h etc)
-            labeled_list = []
-            for symbol, group in df.groupby('symbol'):
-                labeled_list.append(self.generate_labels(group))
-            combined = pd.concat(labeled_list)
-            
-            # 2. Add sector features (Phase 3)
-            combined = self.apply_sector_features(combined, timeframe=timeframe)
-            
-            # 3. Add cross-sectional ranking
-            return self.generate_cross_sectional_labels(combined)
+        if df.empty: return df
+        df = self.generate_labels(df)
+        if 'symbol' in df.columns and len(df['symbol'].unique()) > 1:
+            df = self.apply_sector_features(df, timeframe=timeframe)
+            df = self.generate_cross_sectional_labels(df)
+        return df
 
     def prepare_training_data(self, df: pd.DataFrame, feature_cols: Optional[List[str]] = None,
                                use_prepump_target: bool = True):
@@ -245,13 +238,13 @@ class DatasetBuilder:
         y_targets = df_final[available_targets].copy()
 
         if use_prepump_target and 'is_top3_family_next_24h' in df_final.columns:
-            print("[DatasetBuilder] GT-RANKING: Using strictly is_top3_family_next_24h (Family Discovery)")
+            logger.info("[DatasetBuilder] GT-RANKING: Using strictly is_top3_family_next_24h (Family Discovery)")
             y_targets['primary_clf'] = df_final['is_top3_family_next_24h']
         elif use_prepump_target and 'is_top_decile_family_next_12h' in df_final.columns:
-            print("[DatasetBuilder] GT-RANKING: Using is_top_decile_family_next_12h")
+            logger.info("[DatasetBuilder] GT-RANKING: Using is_top_decile_family_next_12h")
             y_targets['primary_clf'] = df_final['is_top_decile_family_next_12h']
         else:
-            print("[DatasetBuilder] WARNING: Family rank target not found, falling back to absolute hyper_gainer")
+            logger.warning("[DatasetBuilder] Family rank target not found, falling back to absolute hyper_gainer")
             if 'is_hyper_gainer' in df_final.columns:
                 y_targets['primary_clf'] = df_final['is_hyper_gainer']
             else:

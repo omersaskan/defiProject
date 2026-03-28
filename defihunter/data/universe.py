@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import List, Optional
+from defihunter.utils.logger import logger
 
 
 def load_universe(config=None, fetcher=None, strict_defi: bool = True) -> List[str]:
@@ -18,12 +19,12 @@ def load_universe(config=None, fetcher=None, strict_defi: bool = True) -> List[s
     defi_universe = fetcher.get_defi_universe(config=config, strict_defi=strict_defi)
     
     if not defi_universe:
-         print("[Universe] WARNING: Valid DeFi universe is EMPTY. Check config or connectivity. Falling back to active USDT if strict_defi=False.")
+         logger.warning("[Universe] Valid DeFi universe is EMPTY. Check config or connectivity. Falling back to active USDT if strict_defi=False.")
          if not strict_defi:
              return fetcher.get_defi_universe(config=config, strict_defi=False)
          return []
          
-    print(f"[Universe] OVERHAUL: Loaded {len(defi_universe)} symbols for strict DeFi scanning.")
+    logger.info(f"[Universe] OVERHAUL: Loaded {len(defi_universe)} symbols for strict DeFi scanning.")
     return defi_universe
 
 
@@ -132,7 +133,9 @@ def rank_by_relative_volume(symbols: List[str], fetcher, timeframe: str = '1h',
             
             rvr_scores.append((sym, rvr))
             
-        except Exception:
+        except Exception as e:
+            from defihunter.utils.logger import logger
+            logger.warning(f"RVR anomaly fetch failed for {sym}: {e}", exc_info=True)
             continue
     
     # Sort by RVR descending — highest anomaly first
@@ -141,9 +144,9 @@ def rank_by_relative_volume(symbols: List[str], fetcher, timeframe: str = '1h',
     top_symbols = [sym for sym, _ in rvr_scores[:top_n]]
     
     if rvr_scores:
-        print(f"[RVR Pre-Scanner] Top 5 by volume anomaly:")
+        logger.info(f"[RVR Pre-Scanner] Top 5 by volume anomaly:")
         for sym, rvr in rvr_scores[:5]:
-            print(f"  {sym}: RVR={rvr:.2f}x")
+            logger.info(f"  {sym}: RVR={rvr:.2f}x")
     
     return top_symbols
 
@@ -214,12 +217,13 @@ def build_anomaly_watchlist(symbols: List[str], fetcher, criteria: Optional[dict
             if score >= criteria.get('min_criteria_met', 2):
                 watchlist.append((sym, score))
                 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Anomaly watchlist fetch failed for {sym}: {e}", exc_info=True)
             continue
     
     # Sort by score desc
     watchlist.sort(key=lambda x: x[1], reverse=True)
     
     result = [sym for sym, _ in watchlist]
-    print(f"[Anomaly Pre-Scanner] {len(result)}/{len(symbols)} coins qualified (score >= {criteria.get('min_criteria_met', 2)})")
+    logger.info(f"[Anomaly Pre-Scanner] {len(result)}/{len(symbols)} coins qualified (score >= {criteria.get('min_criteria_met', 2)})")
     return result

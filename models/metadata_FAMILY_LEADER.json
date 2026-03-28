@@ -1,0 +1,9 @@
+{
+  "symbol": "FAMILY_LEADER",
+  "trained_at": "2026-03-28 01:51 UTC",
+  "n_samples_total": 138240,
+  "n_samples_train": 110592,
+  "n_features": 89,
+  "auc": 0.9586,
+  "wf_folds": 4
+}
