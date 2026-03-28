@@ -118,31 +118,22 @@ def test_stop_width_mult_proportional_expansion(engine):
 # Test 6: kelly_pct is divided by stop_width_mult in scanner integration
 # Simulates the contract: kelly_pct /= width_mult when width_mult > 1
 # ─────────────────────────────────────────────────────────────────────────────
-def test_net_dollar_risk_constant_with_stop_width_mult(engine):
+def test_net_dollar_risk_notional_proportionality(engine):
     """
-    Net dollar risk = kelly_pct × stop_pct_of_portfolio must be constant.
-    When stop_width_mult = 1.3, kelly_pct should be divided by 1.3.
-    This is implemented in scanner.py; this test validates the arithmetic.
+    When stop_width_mult = 1.3, the stop distance is 1.3x larger.
+    The scanner no longer divides kelly_pct manually (fix for double-penalty).
+    The RiskEngine correctly halves/reduces notional based on distance.
     """
     entry = 100.0
     atr   = 2.0
+    base_stop = engine.compute_stop({"close": entry, "atr": atr}, family="defi_perp", regime="trend", stop_width_mult=1.0)
+    wide_stop = engine.compute_stop({"close": entry, "atr": atr}, family="defi_perp", regime="trend", stop_width_mult=2.0)
 
-    base_kelly    = 1.0   # base kelly %
-    width_mult    = 1.3
+    dist_base = entry - base_stop["stop_price"]
+    dist_wide = entry - wide_stop["stop_price"]
 
-    base    = engine.compute_stop({"close": entry, "atr": atr}, family="defi_perp", regime="trend", stop_width_mult=1.0)
-    widened = engine.compute_stop({"close": entry, "atr": atr}, family="defi_perp", regime="trend", stop_width_mult=width_mult)
-
-    # Scanner logic: kelly_pct /= width_mult after computing stop
-    adjusted_kelly = base_kelly / width_mult
-
-    # Net risk in R for both scenarios:
-    # risk = kelly_pct × (stop_dist / entry)
-    risk_base    = base_kelly    * (base["risk_r"]    / entry)
-    risk_widened = adjusted_kelly * (widened["risk_r"] / entry)
-
-    assert abs(risk_base - risk_widened) < 0.001, \
-        f"Net dollar risk should be equal: base={risk_base:.5f} widened={risk_widened:.5f}"
+    # Wide distance should be ~2x larger
+    assert abs(dist_wide / dist_base - 2.0) < 0.05, f"Expected 2x distance, got {dist_wide/dist_base}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

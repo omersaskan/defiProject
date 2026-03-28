@@ -66,17 +66,27 @@ class PaperTradeEngine:
             self.portfolio.last_reset_day = today_str
             self.save_state()
 
-    def get_daily_loss_pct(self) -> float:
+    def get_daily_loss_pct(self, current_prices: Dict[str, float] = None) -> float:
         """
-        Returns realized daily PnL as a percentage of daily start balance.
+        Returns daily PnL as a percentage of daily start balance.
+        If current_prices is provided, includes UNREALIZED PnL (Equity-based).
+        If current_prices is None, returns only REALIZED PnL.
         Negative values indicate losses (e.g., -1.5 for 1.5% loss).
         """
         self._check_daily_reset()
         if self.portfolio.daily_start_balance <= 0:
             return 0.0
             
+        unrealized_pnl = 0.0
+        if current_prices:
+            for pos in self.portfolio.open_positions:
+                if pos.symbol in current_prices:
+                    curr_p = current_prices[pos.symbol]
+                    unrealized_pnl += (curr_p / pos.entry_price - 1.0) * pos.size_usd
+        
+        total_equity = self.portfolio.balance_usd + unrealized_pnl
         # (Current / Start) - 1.0 -> e.g., (9900/10000) - 1.0 = -0.01
-        pct = (self.portfolio.balance_usd / self.portfolio.daily_start_balance) - 1.0
+        pct = (total_equity / self.portfolio.daily_start_balance) - 1.0
         return pct * 100.0
 
     def open_position(self, decision: Any, risk_pct: float = None, adaptive_stop_result: dict = None):

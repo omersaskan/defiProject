@@ -493,8 +493,8 @@ def run_scanner(config, force_regime=None, limit=0):
     # 7. RISK FILTERING & Execution
 executed_decisions = []
 
-# GT #18: Daily Loss Killswitch Wiring
-daily_loss_pct = paper_engine.get_daily_loss_pct()
+# GT #18: Daily Loss Killswitch Wiring (Unrealized-aware)
+daily_loss_pct = paper_engine.get_daily_loss_pct(current_market_prices)
 
 for d in final_decisions:
     current_portfolio_list = [p.dict() for p in paper_engine.portfolio.open_positions]
@@ -585,9 +585,8 @@ for d in final_decisions:
                 stop_width_mult=width_mult,
             )
 
-            # Wider stop -> smaller % risk to keep net dollar risk sane
-            if width_mult > 1.0:
-                kelly_pct /= width_mult
+            # Wider stop distance already reduces notional in estimate_notional_from_stop.
+            # No manual division of kelly_pct needed (avoiding double-penalty).
 
             logger.info(
                 f"[AdaptiveStop-V2] {d.symbol} | "
@@ -639,7 +638,7 @@ for d in final_decisions:
             family=family_label,
             current_portfolio=current_portfolio_list,
             equity_val=paper_engine.portfolio.balance_usd,
-            daily_loss_pct=daily_loss_pct,   # TODO: wire real daily loss
+            daily_loss_pct=daily_loss_pct,
             leader_prob=d.leader_prob,
             new_trade_notional=actual_notional,
             leverage=getattr(config.risk, "default_leverage", None),
