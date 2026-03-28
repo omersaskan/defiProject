@@ -134,7 +134,7 @@ def run_shadow_validation(
     data_lock       = threading.Lock()
 
     family_engine_inst = FamilyEngine(config) if config else None
-    ml_engine          = MLRankingEngine(model_dir="models")
+    ml_engine          = MLRankingEngine(model_dir=f"models_{timeframe}")
     ema_lengths        = [20, 55]
     if config:
         try:
