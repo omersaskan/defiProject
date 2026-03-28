@@ -16,8 +16,8 @@ def _make_candidate() -> pd.DataFrame:
         "close":            1.0,
         # ── DiscoveryEngine inputs (required for score >= 55) ─────────────────
         "leader_prob":          0.8,     # ml_factor = 0.8 → 32 pts
-        "family_heat_score":    0.1,     # heat at max of clip range → 100% → 35×0.6
-        "family_breadth_score": 1.0,     # breadth = 1.0 → 35×0.4
+        "family_heat":          0.1,     # heat at max of clip range → 100% → 35×0.6
+        "family_breadth":       1.0,     # breadth = 1.0 → 35×0.4
         "peer_momentum":        0.05,    # at max clip → 25×0.5
         "peer_rank":            1.0,     # → 25×0.5  ⇒ total ≈ 92
         # ── EntryEngine inputs ────────────────────────────────────────────────

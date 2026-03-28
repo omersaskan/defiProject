@@ -8,6 +8,7 @@ from defihunter.engines.thresholds import ThresholdResolutionEngine
 from defihunter.engines.discovery import DiscoveryEngine
 from defihunter.engines.entry import EntryEngine
 from defihunter.engines.family import FamilyEngine
+from defihunter.engines.ml_ranking import MLRankingEngine
 from defihunter.execution.backtest import BacktestEngine
 from defihunter.core.config import load_config
 from datetime import datetime
@@ -42,6 +43,8 @@ def run_historical_backtest(config_path="configs/default.yaml", limit=1000, k=3)
     threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes, config=config)
     rule_engine = RuleEngine()
     discovery_engine = DiscoveryEngine()
+    entry_engine = EntryEngine()
+    ml_engine = MLRankingEngine()
     
     all_dfs = []
     
@@ -56,22 +59,20 @@ def run_historical_backtest(config_path="configs/default.yaml", limit=1000, k=3)
         
         regime_label = "trend" 
         resolved_thresholds = threshold_engine.resolve_thresholds(regime=regime_label, family=profile.family_label)
-        df = rule_engine.evaluate(df, regime=regime_label, family=profile.family_label, resolved_thresholds=resolved_thresholds)
-        
-        df = discovery_engine.compute_discovery_scores(df) 
+        df = rule_engine.evaluate(df, regime=regime_label, family=profile.family_label, 
+                                 resolved_thresholds=resolved_thresholds, 
+                                 primary_anchor=profile.primary_anchor)
         
         df['symbol'] = symbol
         df['family'] = profile.family_label
         
-        df['entry_readiness'] = (
-            (df['msb_bull'].astype(float) * 40) +
-            (df['taker_surge'].astype(float) * 25) +
-            (df['v_delta_score'].clip(upper=0.2).fillna(0) * 100) 
-        ).clip(upper=100)
+        # GT-REDESIGN: Use EntryEngine for readiness
+        df = entry_engine.evaluate_readiness(df)
         
-        if 'ml_rank_score' not in df.columns:
-            df['ml_rank_score'] = df['discovery_score']
-            
+        # GT-REDESIGN: Compute Discovery and ML scores
+        df = discovery_engine.compute_discovery_scores(df) 
+        df, _ = ml_engine.rank_candidates(df, use_family_ranker=True)
+        
         all_dfs.append(df)
         
     if not all_dfs:

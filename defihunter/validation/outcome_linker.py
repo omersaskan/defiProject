@@ -46,10 +46,10 @@ class OutcomeLinker:
             return shadow_df
 
         df = shadow_df.copy()
-        df["scan_timestamp"] = pd.to_datetime(df["scan_timestamp"], utc=True)
+        df["scan_timestamp"] = pd.to_datetime(df["scan_timestamp"], utc=True, format='ISO8601', errors='coerce')
 
         price_df = price_df.copy()
-        price_df["timestamp"] = pd.to_datetime(price_df["timestamp"], utc=True)
+        price_df["timestamp"] = pd.to_datetime(price_df["timestamp"], utc=True, format='ISO8601', errors='coerce')
 
         # Build {symbol: price_series} lookup for speed
         price_map: Dict[str, pd.DataFrame] = {

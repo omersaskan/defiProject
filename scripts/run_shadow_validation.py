@@ -58,9 +58,10 @@ def _build_price_df_from_map(symbol_data_map: dict, family_map: dict) -> pd.Data
     rows = []
     for sym, df in symbol_data_map.items():
         for _, bar in df.iterrows():
+            ts = bar.get("timestamp", bar.name)
             rows.append({
                 "symbol":    sym,
-                "timestamp": bar.get("timestamp", bar.name),
+                "timestamp": pd.to_datetime(ts, utc=True, format='ISO8601'),
                 "close":     bar["close"],
                 "high":      bar.get("high", bar["close"]),
                 "low":       bar.get("low",  bar["close"]),
@@ -184,8 +185,12 @@ def run_shadow_validation(
     print("\n[4/6] Building cross-sectional price DataFrame...")
     price_df = _build_price_df_from_map(symbol_data_map, family_map)
 
-    # ── Build master_df for pipeline (last bar per symbol) ───────────────────
-    print("\n[5/6] Running layered pipeline and logging decisions...")
+    # ── Phase 2: Family Aggregation ─────────────────────────────────────────
+    print("\n[Phase 2] Computing Global Family Aggregates...")
+    family_stats = family_aggregator.compute_family_stats(symbol_data_map, timeframe=timeframe)
+
+    # ── Phase 3: Layered Pipeline ─────────────────────────────────────────
+    print("\n[Phase 3] Running layered pipeline and logging decisions...")
     shadow_logger = ShadowLogger(log_path=log_path)
 
     all_rows = []
@@ -200,12 +205,16 @@ def run_shadow_validation(
             else:
                 resolved_thresholds = {"min_score": 50, "min_relative_leadership": 0, "min_volume": 0}
 
-            try:
-                df = family_aggregator.inject_family_features(symbol, df, {}, timeframe=timeframe)
-            except Exception:
-                pass
+            # Parity Fix: Inject real family stats
+            df = family_aggregator.inject_family_features(symbol, df, family_stats, timeframe=timeframe)
+            
+            # Anchor weighting fix parity: pass primary_anchor
+            profile = family_engine_inst.profile_coin(symbol, historical_data=df) if family_engine_inst else None
+            primary_anchor = profile.primary_anchor if profile else "ETH.p"
+            
             df = rule_engine.evaluate(df, regime=regime_label, family=fam,
-                                     resolved_thresholds=resolved_thresholds)
+                                     resolved_thresholds=resolved_thresholds,
+                                     primary_anchor=primary_anchor)
             last_bar = df.tail(1).to_dict("records")[0]
             last_bar.update({"symbol": symbol, "family": fam, "regime": regime_label,
                              "_atr": float(df.iloc[-1].get("atr", 0.0)),

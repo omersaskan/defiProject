@@ -436,11 +436,90 @@ class MLRankingEngine:
         except Exception:
             return np.zeros(len(X))
 
+    def ensure_canonical_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Guarantees that the DataFrame contains all canonical ML columns.
+        Fills missing ones with 0.5 (Neutral) or calls internal heuristic fallback.
+        """
+        required = ["leader_prob", "setup_conversion_prob", "holdability_score", "ml_rank_score", "ml_explanation"]
+        missing = [c for c in required if c not in df.columns or df[c].isna().all()]
+        
+        if not missing:
+            return df
+            
+        logger.info(f"[ML-CONTRACT] Filling missing canonical columns: {missing}")
+        return self.heuristic_fallback(df)
+
+    def heuristic_fallback(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Internalized heuristic fallback logic to provide high-quality estimates
+        when ML models (especially family-ranker suite) are unavailable.
+        """
+        df = df.copy()
+        
+        def _safe_series(col: str, default: float = 0.5) -> pd.Series:
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce").fillna(default)
+            return pd.Series(default, index=df.index)
+
+        def _norm01(s: pd.Series, neutral: float = 0.5) -> pd.Series:
+            if s.isna().all(): return pd.Series(neutral, index=s.index)
+            lo, hi = s.min(), s.max()
+            if abs(hi - lo) < 1e-12: return pd.Series(neutral, index=s.index)
+            return (s - lo) / (hi - lo)
+
+        # Base components for heuristic
+        ml_rank         = _norm01(_safe_series("ml_rank_score", 0.5))
+        entry_readiness = _norm01(_safe_series("entry_readiness", 0.5))
+        fakeout_risk    = _norm01(_safe_series("fakeout_risk", 0.5))
+        low_fakeout     = 1.0 - fakeout_risk
+        
+        # Peer metrics from Discovery/Leadership
+        peer_rank       = _norm01(_safe_series("peer_rank", 0.5))
+        peer_momentum   = _norm01(_safe_series("peer_momentum", 0.0))
+        rs_div          = _norm01(_safe_series("rs_divergence_persistence", 0.0))
+
+        # Core Heuristic Score (0.0 to 1.0)
+        h_score = (
+            0.22 * ml_rank +
+            0.22 * entry_readiness +
+            0.18 * low_fakeout +
+            0.12 * peer_rank +
+            0.10 * peer_momentum +
+            0.08 * rs_div +
+            0.08 * _safe_series("quiet_expansion", 0.0).clip(0, 1)
+        ).clip(0.0, 1.0)
+
+        # Map to canonical columns if missing
+        if "leader_prob" not in df.columns or df["leader_prob"].isna().all():
+            df["leader_prob"] = (0.35 + 0.55 * h_score).clip(0.05, 0.95)
+            
+        if "setup_conversion_prob" not in df.columns or df["setup_conversion_prob"].isna().all():
+            df["setup_conversion_prob"] = (0.30 + 0.60 * h_score).clip(0.05, 0.95)
+            
+        if "holdability_score" not in df.columns or df["holdability_score"].isna().all():
+            df["holdability_score"] = (100.0 * (0.45 * h_score + 0.30 * entry_readiness + 0.25 * low_fakeout)).clip(0, 100)
+            
+        if "ml_rank_score" not in df.columns or df["ml_rank_score"].isna().all():
+            df["ml_rank_score"] = h_score * 100.0
+            
+        if "ml_explanation" not in df.columns or df["ml_explanation"].isna().all():
+            df["ml_explanation"] = "[HEURISTIC_FALLBACK] Rule-based consensus"
+            
+        # Backward compatibility aliases
+        if "setup_quality_prob" not in df.columns:
+            df["setup_quality_prob"] = df["setup_conversion_prob"]
+        if "hold_quality" not in df.columns:
+            df["hold_quality"] = df["holdability_score"]
+
+        return df
+
     def rank_candidates(self, candidates: pd.DataFrame, top_n: int = 5, use_family_ranker: bool = False) -> Tuple[pd.DataFrame, List[str]]:
         """
         Dynamically loads the correct Regime-Aware model (GLOBAL_TREND or GLOBAL_CHOP)
         and scores candidates for both Long and Short EV.
         GT-REDESIGN: now supports Phase 4 tri-score output.
+        Guarantees canonical columns via ensure_canonical_columns.
         """
         if candidates.empty:
             return candidates, []
@@ -526,6 +605,10 @@ class MLRankingEngine:
             scored_groups.append(group)
         
         candidates = pd.concat(scored_groups)
+        
+        # FINAL ENSURE CANONICAL
+        candidates = self.ensure_canonical_columns(candidates)
+        
         candidates = candidates.sort_values(by='ml_rank_score', ascending=False)
         top_candidates = candidates.head(top_n)['symbol'].tolist()
         

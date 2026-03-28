@@ -3,7 +3,7 @@ import os
 from defihunter.utils.logger import logger
 from datetime import datetime
 from typing import List, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class PaperPosition(BaseModel):
     symbol: str
@@ -27,8 +27,8 @@ class PaperPortfolio(BaseModel):
     initial_balance: float = 10000.0
     daily_start_balance: float = 10000.0
     last_reset_day: str = ""
-    open_positions: List[PaperPosition] = []
-    trade_history: List[PaperPosition] = []
+    open_positions: List[PaperPosition] = Field(default_factory=list)
+    trade_history: List[PaperPosition] = Field(default_factory=list)
     last_update: str = ""
 
 class PaperTradeEngine:

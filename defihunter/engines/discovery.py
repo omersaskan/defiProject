@@ -29,8 +29,8 @@ class DiscoveryEngine:
         
         # 2. Family Factor (0-1.0)
         # Combines family heat (momentum) and breadth (participation)
-        f_heat = (df['family_heat_score'] if 'family_heat_score' in df.columns else pd.Series(0.0, index=df.index)).fillna(0).clip(lower=0, upper=0.1) / 0.1
-        f_breadth = (df['family_breadth_score'] if 'family_breadth_score' in df.columns else pd.Series(0.0, index=df.index)).fillna(0)
+        f_heat = (df['family_heat'] if 'family_heat' in df.columns else pd.Series(0.0, index=df.index)).fillna(0).clip(lower=0, upper=0.1) / 0.1
+        f_breadth = (df['family_breadth'] if 'family_breadth' in df.columns else pd.Series(0.0, index=df.index)).fillna(0)
         df['family_factor'] = (f_heat * 0.6 + f_breadth * 0.4)
 
         # 3. Strength Factor (0-1.0)

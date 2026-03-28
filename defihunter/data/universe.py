@@ -3,7 +3,6 @@ import numpy as np
 from typing import List, Optional
 from defihunter.utils.logger import logger
 
-
 def load_universe(config=None, fetcher=None, strict_defi: bool = True) -> List[str]:
     """
     GT-UNIVERSE: Core entry point for symbol discovery.
@@ -88,69 +87,48 @@ def filter_universe(
 
     return df[mask]
 
-
-def rank_by_relative_volume(symbols: List[str], fetcher, timeframe: str = '1h',
-                             lookback_bars: int = 170, top_n: int = 25) -> List[str]:
+def rank_by_relative_volume(
+    symbols: List[str],
+    fetcher,
+    timeframe: str = "1h",
+    lookback_bars: int = 170,
+    top_n: int = 25,
+) -> List[str]:
     """
     GT-NEW-4: Relative Volume Rank (RVR) Pre-Scanner Filter.
-    
     Ranks all coins by: (last 24h volume) / (7-day average hourly volume).
     Returns top_n coins with the most anomalous volume activity today.
-    
-    Key insight: Daily top gainers almost always appear in the top 20-30 
-    by RVR score, hours BEFORE the price move. This pre-scanner dramatically 
-    cuts the search space from 200+ coins to top 25 anomalies.
-    
-    Args:
-        symbols: Full universe of coin symbols (e.g. ['BTC.p', 'ETH.p', ...])
-        fetcher: BinanceFuturesFetcher instance
-        timeframe: '1h' recommended for 24h / 7d comparison
-        lookback_bars: How many bars to fetch (170 gives ~7 days of 1h data)
-        top_n: Number of top RVR coins to return for full analysis
-        
-    Returns:
-        List of symbols sorted by RVR score (highest first), limited to top_n.
     """
     rvr_scores = []
-    
+
     for sym in symbols:
         try:
             df = fetcher.fetch_ohlcv(sym, timeframe=timeframe, limit=lookback_bars)
             if df.empty or len(df) < 50:
                 continue
-            
-            vol = df['volume'].values
-            
-            # 7-day avg: bars 0 to -25 (exclude last 24 to get clean baseline)
+
+            vol = df["volume"].values
+
             baseline_bars = vol[:-24] if len(vol) > 48 else vol
             avg_7d = float(np.mean(baseline_bars)) if len(baseline_bars) > 0 else 1.0
-            
-            # Last 24 bars volume (today)
             last_24h_vol = float(np.sum(vol[-24:]))
-            
-            # RVR = today's total / expected daily volume
             rvr = last_24h_vol / (avg_7d * 24 + 1e-8)
-            
+
             rvr_scores.append((sym, rvr))
-            
+
         except Exception as e:
-            from defihunter.utils.logger import logger
             logger.warning(f"RVR anomaly fetch failed for {sym}: {e}", exc_info=True)
             continue
-    
-    # Sort by RVR descending — highest anomaly first
+
     rvr_scores.sort(key=lambda x: x[1], reverse=True)
-    
     top_symbols = [sym for sym, _ in rvr_scores[:top_n]]
-    
+
     if rvr_scores:
-        logger.info(f"[RVR Pre-Scanner] Top 5 by volume anomaly:")
+        logger.info("[RVR Pre-Scanner] Top 5 by volume anomaly:")
         for sym, rvr in rvr_scores[:5]:
             logger.info(f"  {sym}: RVR={rvr:.2f}x")
-    
+
     return top_symbols
-
-
 def build_anomaly_watchlist(symbols: List[str], fetcher, criteria: Optional[dict] = None) -> List[str]:
     """
     GT-NEW-8: Anomaly Pre-Scanner — fast multi-criteria watchlist builder.

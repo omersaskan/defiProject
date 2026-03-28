@@ -102,9 +102,10 @@ class LeadershipEngine:
     def add_leadership_features(self, df: pd.DataFrame, anchor_data: Dict[str, pd.DataFrame], timeframe: str = '15m') -> pd.DataFrame:
         """
         Adds rel_spread_* features and their derivatives.
-        GT-REDESIGN: Timeframe-aware derivatives.
+        GT-REDESIGN: Optimized to minimize DataFrame fragmentation via batch assignment.
         """
         df = df.copy()
+        new_cols = {}
         
         for anchor in self.anchors:
             if anchor not in anchor_data:
@@ -114,52 +115,58 @@ class LeadershipEngine:
             
             # Align anchor index
             if 'timestamp' in df.columns and 'timestamp' in adf.columns:
-                coin_ts = df['timestamp'].reset_index(drop=True)
                 adf = adf.sort_values('timestamp').reset_index(drop=True)
                 if len(adf) != len(df):
                     if len(adf) > len(df):
                         adf = adf.tail(len(df)).reset_index(drop=True)
                     else:
                         adf = adf.reindex(range(len(df))).ffill().bfill()
-            else:
-                adf = adf.reset_index(drop=True)
-                df  = df.reset_index(drop=True)
             
             for length in self.ema_lengths:
                 if f'ema_{length}' not in df.columns or f'ema_{length}' not in adf.columns:
                     continue
                     
-                coin_ema = df[f'ema_{length}'].reset_index(drop=True)
-                anchor_ema = adf[f'ema_{length}'].reset_index(drop=True)
-                coin_close = df['close'].reset_index(drop=True)
-                anchor_close = adf['close'].reset_index(drop=True)
+                coin_ema = df[f'ema_{length}'].values
+                anchor_ema = adf[f'ema_{length}'].values
+                coin_close = df['close'].values
+                anchor_close = adf['close'].values
                 
                 anchor_name = anchor.split('.')[0].lower()
                 spread_col = f'rel_spread_{anchor_name}_ema{length}'
                 
                 # Base Spread
-                df[spread_col] = compute_log_spread(coin_close, coin_ema, anchor_close, anchor_ema).values
+                spread_vals = np.log(coin_close / coin_ema) - np.log(anchor_close / anchor_ema)
+                new_cols[spread_col] = spread_vals
                 
                 # 1. Slope (timeframe-aware)
                 h1_bars = TimeframeHelper.get_bars('1h', timeframe)
                 h4_bars = TimeframeHelper.get_bars('4h', timeframe)
-                df[f'{spread_col}_slope_4'] = df[spread_col].diff(h1_bars) / h1_bars
-                df[f'{spread_col}_slope_12'] = df[spread_col].diff(h4_bars) / h4_bars
+                
+                s_series = pd.Series(spread_vals)
+                new_cols[f'{spread_col}_slope_4'] = s_series.diff(h1_bars).values / h1_bars
+                new_cols[f'{spread_col}_slope_12'] = s_series.diff(h4_bars).values / h4_bars
                 
                 # 2. Persistence
-                is_positive = (df[spread_col] > 0).astype(int)
-                df[f'{spread_col}_persistence'] = is_positive.groupby((is_positive != is_positive.shift()).cumsum()).cumsum()
+                is_positive = (s_series > 0).astype(int)
+                new_cols[f'{spread_col}_persistence'] = is_positive.groupby((is_positive != is_positive.shift()).cumsum()).cumsum().values
                 
                 # 3. Acceleration
-                df[f'{spread_col}_acceleration'] = df[f'{spread_col}_slope_4'].diff(h1_bars)
+                new_cols[f'{spread_col}_acceleration'] = pd.Series(new_cols[f'{spread_col}_slope_4']).diff(h1_bars).values
                 
                 # 4. Z-Score (24h lookback)
                 z_bars = TimeframeHelper.get_bars('24h', timeframe)
-                rolling_mean = df[spread_col].rolling(window=z_bars, min_periods=min(10, z_bars)).mean()
-                rolling_std = df[spread_col].rolling(window=z_bars, min_periods=min(10, z_bars)).std() + 1e-8
-                df[f'{spread_col}_z_96'] = (df[spread_col] - rolling_mean) / rolling_std
+                rolling_mean = s_series.rolling(window=z_bars, min_periods=min(10, z_bars)).mean()
+                rolling_std = s_series.rolling(window=z_bars, min_periods=min(10, z_bars)).std() + 1e-8
+                new_cols[f'{spread_col}_z_96'] = ((s_series - rolling_mean) / rolling_std).values
                 
-                # Leadership Decay check
+        # Bulk add new columns to avoid fragmentation
+        if new_cols:
+            df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+        # Post-process leadership decay (needs the cols we just added)
+        for anchor in self.anchors:
+            anchor_name = anchor.split('.')[0].lower()
+            for length in self.ema_lengths:
                 df = self.compute_leadership_decay(df, anchor_name, length)
                 
         # GT #2: Compute RS Divergence against BTC anchor

@@ -5,7 +5,8 @@ class RuleEngine:
     def __init__(self):
         pass
         
-    def evaluate(self, df: pd.DataFrame, regime: str, family: str, resolved_thresholds: dict, sector_data: dict = None, adaptive_weights: dict = None) -> pd.DataFrame:
+    def evaluate(self, df: pd.DataFrame, regime: str, family: str, resolved_thresholds: dict, 
+                 sector_data: dict = None, adaptive_weights: dict = None, primary_anchor: str = None) -> pd.DataFrame:
         """
         Deterministic signal engine: Hard filters -> Soft scores -> Veto.
         Integrates sector leadership multipliers and advanced setup detection.
@@ -24,7 +25,7 @@ class RuleEngine:
         df = self._apply_hard_filters(df, resolved_thresholds)
             
         # 2. Soft scores
-        df = self._calculate_soft_scores(df, sector_multiplier, family, adaptive_weights)
+        df = self._calculate_soft_scores(df, sector_multiplier, family, adaptive_weights, primary_anchor)
         
         # 3. Regime-specific entry threshold
         min_score = resolved_thresholds.get('min_score', 50)
@@ -74,7 +75,8 @@ class RuleEngine:
             
         return df
 
-    def _calculate_soft_scores(self, df: pd.DataFrame, sector_multiplier: float, family: str, adaptive_weights: dict) -> pd.DataFrame:
+    def _calculate_soft_scores(self, df: pd.DataFrame, sector_multiplier: float, family: str, 
+                               adaptive_weights: dict, primary_anchor: str = None) -> pd.DataFrame:
         # A) Trend Score
         df['trend_score'] = 0
         if 'ema_55' in df.columns and 'ema_100' in df.columns:
@@ -128,7 +130,7 @@ class RuleEngine:
         df['participation_score'] = df['participation_score'].clip(upper=35)
             
         # D) Relative Leadership Score
-        df = self._calculate_relative_leadership_score(df, family, sector_multiplier)
+        df = self._calculate_relative_leadership_score(df, family, sector_multiplier, primary_anchor)
             
         # E) Funding Penalty
         df['funding_penalty'] = 0.0
@@ -167,7 +169,7 @@ class RuleEngine:
         )
         return df
 
-    def _calculate_relative_leadership_score(self, df: pd.DataFrame, family: str, sector_multiplier: float) -> pd.DataFrame:
+    def _calculate_relative_leadership_score(self, df: pd.DataFrame, family: str, sector_multiplier: float, primary_anchor: str = None) -> pd.DataFrame:
         df['relative_leadership_score'] = 0.0
         
         if sector_multiplier > 1.05 and 'return_4' in df.columns:
@@ -176,8 +178,14 @@ class RuleEngine:
 
         rel_cols = [c for c in df.columns if 'rel_spread_' in c and all(k not in c for k in ['slope', 'persistence', 'z', 'acceleration'])]
         for rc in rel_cols:
-            base_anchor_name = rc.split('_')[2]
-            mult = 1.5 if base_anchor_name == family else 1.0
+            base_anchor_name = rc.split('_')[2] # e.g. BTC from rel_spread_BTC_p
+            
+            # Anchor weighting fix: compare anchor name with family's primary_anchor (e.g. AAVE in AAVE.p)
+            is_primary = False
+            if primary_anchor and base_anchor_name.lower() in primary_anchor.lower():
+                is_primary = True
+                
+            mult = 1.5 if is_primary else 1.0
             
             df.loc[df[rc] > 0.005, 'relative_leadership_score'] += (5 * mult)
             if f"{rc}_slope_4" in df.columns:

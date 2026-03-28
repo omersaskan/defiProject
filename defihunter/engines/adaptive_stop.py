@@ -6,10 +6,8 @@ V2 key changes vs V1:
   2. noise_tolerance_bars — first N bars block trailing/breakeven
   3. fakeout_risk > 60 → reduce_size_first=True (stop WIDENS, not tightens)
      V1 bug: fakeout tight stop = more whipsaws. V2 fix: size down, stop stays wider.
-  4. stop_width_mult parameter (from FamilyExecutionConfig); size responsibility
-     is on the caller — caller MUST divide size_usd by stop_width_mult to maintain
-     constant net dollar risk.
-  5. defi_perp ATR mult: 1.2x → 1.6x (wider stop = less whipsaw; size halved externally)
+  4. stop_width_mult parameter (from FamilyExecutionConfig)
+  5. defi_perp ATR mult: 1.2x → 1.6x (wider stop = less whipsaw)
   6. stop_confidence score returned (0–1): caller can log/use for diagnostics
 
 Stop modes:
@@ -85,12 +83,6 @@ class AdaptiveStopEngine:
     """
     V2: computes adaptive dual-layer stop/TP levels based on family, regime,
     fakeout_risk, ATR, and structural levels.
-
-    Key contract about stop_width_mult:
-        This engine accepts stop_width_mult as a parameter and applies it to
-        the stop distance. The CALLER must divide position size_usd by
-        stop_width_mult to ensure net dollar risk stays constant:
-            effective_size_usd = base_size_usd / stop_width_mult
     """
 
     def compute_stop(

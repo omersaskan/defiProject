@@ -10,6 +10,44 @@ class EntryEngine:
     def __init__(self, min_readiness: float = 65.0):
         self.min_readiness = min_readiness
 
+    def evaluate_readiness(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Batch evaluation for historical data (backtesting).
+        Populates 'entry_readiness' and 'fakeout_risk' columns.
+        """
+        if df.empty:
+            return df
+            
+        df = df.copy()
+        
+        # 1. Component Flags (Vectorized)
+        ready_score = pd.Series(0.0, index=df.index)
+        if 'msb_bull' in df.columns:
+            ready_score += df['msb_bull'].astype(float) * 40
+        if 'taker_surge' in df.columns:
+            ready_score += df['taker_surge'].astype(float) * 25
+        if 'v_delta_score' in df.columns:
+            ready_score += (df['v_delta_score'] > 0.08).astype(float) * 20
+        if 'squeeze_release' in df.columns:
+            ready_score += df['squeeze_release'].astype(float) * 15
+            
+        df['entry_readiness'] = ready_score.clip(upper=100.0)
+        
+        # 2. Fakeout Risk (Vectorized)
+        risk_score = pd.Series(0.0, index=df.index)
+        if 'breakout_quality' in df.columns and 'is_breakout_bar' in df.columns:
+            risk_score += ((df['breakout_quality'] < 40) & df['is_breakout_bar'].astype(bool)).astype(float) * 40
+        
+        if 'exhaustion_risk_score' in df.columns:
+            risk_score += df['exhaustion_risk_score'] * 0.5
+            
+        if 'upper_wick_ratio' in df.columns:
+            risk_score += (df['upper_wick_ratio'] > 0.6).astype(float) * 20
+            
+        df['fakeout_risk'] = risk_score.clip(upper=100.0)
+        
+        return df
+
     def compute_entry_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Calculates EntryReadiness and FakeoutRisk for a single coin.

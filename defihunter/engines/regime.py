@@ -195,10 +195,10 @@ class SectorRegimeEngine:
         strongest = "eth"
         
         if lend_alpha > dex_alpha and lend_alpha > 0.015:
-            strongest = "lending"
+            strongest = "defi_lending"
             label = "defi_lend_led"
         elif dex_alpha > lend_alpha and dex_alpha > 0.015:
-            strongest = "dex_amm"
+            strongest = "defi_dex"
             label = "defi_dex_led"
             
         # Bug #8 Fix: Keys must match FamilyEngine family labels (defi_lending, defi_dex_amm, etc.)
@@ -214,16 +214,19 @@ class SectorRegimeEngine:
             "lending_alpha": round(lend_alpha, 4),
             "dex_alpha": round(dex_alpha, 4),
             "sector_scores": {
-                # Short aliases (legacy)
+                # Legacy aliases (optional)
                 "lending": lend_score,
                 "dex_amm": dex_score,
-                # Full labels matching FamilyEngine output
+                # Canonical labels matching default.yaml and FamilyEngine
                 "defi_lending": lend_score,
+                "defi_dex":     dex_score,
                 "defi_dex_amm": dex_score,
-                "defi_lsd": lend_score,          # LSD correlated with lending
-                "defi_oracles": dex_score * 0.9,  # Oracles slightly discounted
-                "defi_derivatives": dex_score,
-                "defi_beta": 1.0                  # Neutral for generic beta
+                "defi_perp":    dex_score,
+                "defi_lsd":     lend_score,
+                "defi_oracles": dex_score * 0.9,
+                "defi_yield":   dex_score,
+                "defi_infra":   lend_score * 0.8,
+                "defi_beta":    1.0
             }
         }
 
