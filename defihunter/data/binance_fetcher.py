@@ -1,5 +1,8 @@
 import ccxt
+import ccxt.async_support as ccxt_async
+import asyncio
 import pandas as pd
+
 from typing import List, Dict, Optional
 import time
 from defihunter.utils.logger import logger
@@ -17,6 +20,32 @@ class BinanceFuturesFetcher:
         self.spot_exchange = ccxt.binance({
             'enableRateLimit': True
         })
+        
+        # Async Exchanges
+        self.a_exchange = None
+        self.a_spot_exchange = None
+
+    async def _get_a_exchange(self):
+        if self.a_exchange is None:
+            self.a_exchange = ccxt_async.binanceusdm({
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future'}
+            })
+        return self.a_exchange
+
+    async def _get_a_spot_exchange(self):
+        if self.a_spot_exchange is None:
+            self.a_spot_exchange = ccxt_async.binance({
+                'enableRateLimit': True
+            })
+        return self.a_spot_exchange
+
+    async def close(self):
+        if self.a_exchange:
+            await self.a_exchange.close()
+        if self.a_spot_exchange:
+            await self.a_spot_exchange.close()
+
 
     def get_defi_universe(self, config=None, strict_defi: bool = True) -> List[str]:
         """
@@ -317,7 +346,35 @@ class BinanceFuturesFetcher:
             logger.error(f"Error fetching OHLCV for {symbol}: {e}")
             return pd.DataFrame()
 
-    def fetch_spot_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 100) -> pd.DataFrame:
+    async def async_fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 500) -> pd.DataFrame:
+        """Async version of fetch_ohlcv."""
+        try:
+            api_symbol = self._format_to_api(symbol)
+            exchange = await self._get_a_exchange()
+            
+            ohlcv = await exchange.fetch_ohlcv(api_symbol, timeframe, limit=limit)
+            if not ohlcv: return pd.DataFrame()
+            
+            if len(ohlcv[0]) >= 12:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
+                df['taker_buy_volume'] = df['taker_buy_base'].astype(float)
+                df['taker_sell_volume'] = df['volume'].astype(float) - df['taker_buy_base'].astype(float)
+            else:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['quote_volume'] = df['volume'] * df['close']
+            
+            # Async Funding & OI (Simplified for now, or we can make them async too)
+            # For Phase 3, we want at least basic OHLCV to be async for the parallel scanner
+            df['funding_rate'] = 0.0
+            df['open_interest'] = 0.0
+            df['spread_bps'] = 5.0
+            return df
+        except Exception as e:
+            logger.error(f"[AsyncFetcher] Error for {symbol}: {e}")
+            return pd.DataFrame()
+
         """
         GT-PRO #1: Fetches Spot OHLCV for a coin to compare with Futures.
         """

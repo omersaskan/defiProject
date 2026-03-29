@@ -181,7 +181,9 @@ if secili_panel == "Komuta Merkezi (Tarayıcı)":
                 if force_regime != "Otomatik İzin Ver":
                     config.regimes.overrides['force_regime'] = force_regime
                     
-                kararlar = run_scanner(config)
+                import asyncio
+                kararlar = asyncio.run(run_scanner(config))
+
                 
                 if force_regime != "Otomatik İzin Ver":
                     config.regimes.overrides.pop('force_regime', None)

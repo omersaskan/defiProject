@@ -64,8 +64,10 @@ def main():
 
     # ── SCAN ────────────────────────────────────────────────────────────────
     if args.command == 'scan':
+        import asyncio
         print(f"[*] Config loaded: anchors={config.anchors}")
-        run_scanner(config, limit=args.limit)
+        asyncio.run(run_scanner(config, limit=args.limit))
+
 
     # ── BACKTEST ─────────────────────────────────────────────────────────────
     elif args.command == 'backtest':

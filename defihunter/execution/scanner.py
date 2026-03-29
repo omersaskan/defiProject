@@ -1,697 +1,369 @@
 import os
 import time
 import json
-import csv
 import pandas as pd
 import numpy as np
-import pytz
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+
 from defihunter.data.binance_fetcher import BinanceFuturesFetcher
 from defihunter.data.features import build_feature_pipeline
-from defihunter.engines.leadership import LeadershipEngine
-from defihunter.engines.regime import MarketRegimeEngine, SectorRegimeEngine
-from defihunter.engines.rules import RuleEngine
-from defihunter.engines.thresholds import ThresholdResolutionEngine
-from defihunter.engines.ml_ranking import MLRankingEngine
-from defihunter.engines.family import FamilyEngine
-from defihunter.engines.discovery import DiscoveryEngine
-from defihunter.engines.entry import EntryEngine
-from defihunter.engines.family_aggregator import FamilyAggregator
-from defihunter.engines.decision import DecisionEngine
 from defihunter.engines.adaptive import AdaptiveWeightsEngine
 from defihunter.engines.adaptive_stop import AdaptiveStopEngine
-from defihunter.utils.logger import logger
 from defihunter.engines.exit_decay import ExitDecayEngine
-from defihunter.execution.paper_trade import PaperTradeEngine
 from defihunter.engines.risk import RiskEngine
+from defihunter.execution.paper_trade import PaperTradeEngine
 from defihunter.execution.broadcaster import SignalBroadcaster
-from defihunter.data.features import compute_family_features
+from defihunter.execution.pipeline import SignalPipeline
 from defihunter.validation.shadow_logger import ShadowLogger
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from defihunter.utils.logger import logger
+from defihunter.utils.db_manager import db_manager
+from defihunter.utils.monitor import monitor
 
 
-# Shadow Logging is now handled by ShadowLogger engine.
 
-
-def detect_momentum_cluster(rows: list) -> dict:
-    """
-    GT #5: Multi-Coin Momentum Cluster Detection.
-    If 3+ coins from the same family signal accumulation simultaneously,
-    a sector-wide move is likely imminent. Returns dict of {family: count}.
-    """
-    family_signals = {}
-    for r in rows:
-        fam = r.get("Family", "unknown")
-        has_gt_signal = (
-            r.get("Silent_Accumulation", False)
-            or r.get("Orderbook_Vacuum", False)
-            or r.get("quiet_expansion", False)
-            or r.get("rs_divergence_persistence", 0) >= 3
-        )
-        if has_gt_signal:
-            family_signals[fam] = family_signals.get(fam, 0) + 1
-
-    clusters = {f: count for f, count in family_signals.items() if count >= 3}
-    return clusters
-
-
-def compute_mtf_prepump_score(coin_data_dict: dict) -> float:
-    """
-    GT #6 + GT-GOLD-1: MTF Pre-Pump Confluence Score.
-    4h trend alignment + 1h setup formation + 15m entry point = highest quality signal.
-    GT-GOLD-1: Also checks if BOTH 15m AND 1h entry_signal are True (hard confluence gate).
-    Returns 0-100 score. 70+ is high-conviction pre-pump.
-    """
-    score = 0.0
-
-    df_4h = coin_data_dict.get("4h", pd.DataFrame())
-    if not df_4h.empty:
-        last_4h = df_4h.iloc[-1]
-        if last_4h.get("close", 0) > last_4h.get("ema_55", 0):
-            score += 30
-        if last_4h.get("close", 0) > last_4h.get("ema_20", 0):
-            score += 10
-
-    df_1h = coin_data_dict.get("1h", pd.DataFrame())
-    if not df_1h.empty:
-        last_1h = df_1h.iloc[-1]
-        for flag, pts in [
-            ("silent_accumulation", 40),
-            ("orderbook_vacuum", 35),
-            ("quiet_expansion", 25),
-            ("rs_strong_divergence", 20),
-            ("cvd_price_divergence", 30),
-            ("near_liquidation_band", 30),
-            ("launch_mode", 20),
-            ("coiling_breakout_alert", 20),
-            ("high_quality_breakout", 15),
-        ]:
-            if last_1h.get(flag, False):
-                score += pts
-
-    df_15m = coin_data_dict.get("15m", pd.DataFrame())
-    if not df_15m.empty:
-        last_15m = df_15m.iloc[-1]
-        if last_15m.get("sweep_reclaim_confirmed", False):
-            score += 30
-        if last_15m.get("rs_divergence_persistence", 0) >= 2:
-            score += 10
-        if last_15m.get("entry_signal", False) and not df_1h.empty and df_1h.iloc[-1].get("entry_signal", False):
-            score += 25
-
-    return min(score, 100.0)
-
-
+# Constants
 MEM_FILE = "logs/false_signals.json"
-_false_signal_memory = {}
 FALSE_SIGNAL_COOLDOWN_BARS = 48
 FALSE_SIGNAL_MAX_FAILS = 3
-
+_false_signal_memory = {}
+_executor = ProcessPoolExecutor(max_workers=min(8, multiprocessing.cpu_count()))
 
 def load_false_signal_memory():
-    """Load failure memory from disk."""
     global _false_signal_memory
     if os.path.exists(MEM_FILE):
         try:
             with open(MEM_FILE, "r") as f:
                 _false_signal_memory = json.load(f)
         except Exception as e:
-            logger.error(f"[GT #17] Load memory failed: {e}", exc_info=True)
-
+            logger.error(f"[Memory] Load failed: {e}")
 
 def save_false_signal_memory():
-    """Save failure memory to disk."""
     os.makedirs(os.path.dirname(MEM_FILE), exist_ok=True)
     try:
         with open(MEM_FILE, "w") as f:
             json.dump(_false_signal_memory, f, indent=2)
     except Exception as e:
-        logger.error(f"[GT #17] Save memory failed: {e}", exc_info=True)
+        logger.error(f"[Memory] Save failed: {e}")
 
-
-def get_top_movers(fetcher, top_n: int = 30) -> list:
+class ScanPipeline:
     """
-    GT #16: Fetch current 24h gainers from Binance.
-    Prioritize these coins for scanning.
-    Returns list of COIN.p formatted symbols.
+    GT-Institutional: Modular Execution Pipeline (Scanner Layer).
+    Responsible for I/O, Risk, and side effects. Delegates core signal logic to SignalPipeline.
     """
-    try:
-        tickers = fetcher.exchange.fetch_tickers()
-        movers = []
-        for sym, t in tickers.items():
-            if "/USDT:USDT" in sym or sym.endswith("/USDT"):
-                pct = t.get("percentage") or t.get("change") or 0
-                base = sym.split("/")[0]
-                movers.append((f"{base}.p", float(pct)))
+    def __init__(self, config: Any, fetcher: Optional[BinanceFuturesFetcher] = None):
+        self.config = config
+        self.fetcher = fetcher or BinanceFuturesFetcher()
+        self.timeframe = getattr(config, "timeframe", "15m")
+        
+        # 1. CORE SIGNAL PIPELINE (The brain)
+        self.signal_core = SignalPipeline(config)
+        
+        # 2. ORCHESTRATION ENGINES (The hands)
+        self.adaptive_engine = AdaptiveWeightsEngine()
+        self.decay_engine = ExitDecayEngine(config=config)
+        self.paper_engine = PaperTradeEngine()
+        self.adaptive_stop_engine = AdaptiveStopEngine()
+        self.risk_engine = RiskEngine(config.risk.dict(), fetcher=self.fetcher)
+        self.broadcaster = SignalBroadcaster(config=config)
+        self.shadow_logger = ShadowLogger()
+        self.loop = asyncio.get_event_loop()
 
-        pre_pump = [(s, p) for s, p in movers if 1.0 < p < 10.0]
-        pre_pump.sort(key=lambda x: -x[1])
-        return [s for s, _ in pre_pump[:top_n]]
-    except Exception as e:
-        logger.error(f"[GT #16] get_top_movers failed: {e}")
-        return []
-
-
-BEHAVIOR_ENCODING = {
-    "breakout_continuation": 0,
-    "mean_reverting": 1,
-    "retest_friendly": 2,
-    "catalyst_sensitive": 3,
-    "fake_breakout_prone": 4,
-}
-
-
-def should_skip_false_signal(symbol: str, memory: dict, cooldown_bars: int = FALSE_SIGNAL_COOLDOWN_BARS) -> bool:
-    """
-    GT #17: Skip coins with too many consecutive failed signals.
-    """
-    rec = memory.get(symbol, {})
-    if rec.get("count", 0) >= FALSE_SIGNAL_MAX_FAILS and not rec.get("hit", False):
-        last_scan = rec.get("last_scan_bar", 0)
-        current_bar = rec.get("current_bar", last_scan + 1)
-        if (current_bar - last_scan) < cooldown_bars:
-            return True
-    return False
+        # State
+        self.anchor_mtf = {}
+        self.symbol_data_map = {}
+        self.current_market_prices = {}
+        self.current_market_highs = {}
+        self.current_market_lows = {}
+        self.decay_signals = {}
+        
+        # Metadata for logging/UI
+        self.adaptive_stop_map = {}
+        self.kelly_map = {}
+        self.paper_opened = set()
 
 
-def update_false_signal_memory(memory: dict, paper_positions: list) -> None:
-    """
-    GT #17: Update false signal memory based on paper trade outcomes.
-    """
-    for pos in paper_positions:
-        sym = pos.get("symbol", "")
-        outcome = pos.get("outcome", "open")
-        if outcome == "win":
-            if sym in memory:
-                memory[sym]["hit"] = True
-                memory[sym]["count"] = 0
-        elif outcome in ("loss", "time_exit"):
-            if sym not in memory:
-                memory[sym] = {"count": 0, "hit": False, "last_scan_bar": 0}
-            memory[sym]["count"] = memory[sym].get("count", 0) + 1
-            memory[sym]["hit"] = False
+    async def run(self, force_regime: Optional[str] = None, limit: int = 0):
+        """Orchestrate the entire scan from fetch to execution (ASYNCHRONOUS)."""
+        start_t = time.time()
+        load_false_signal_memory()
 
-
-def add_sector_momentum_features(rows: list) -> list:
-    """
-    GT #15: Peer Momentum — how does a coin perform vs its sector average?
-    """
-    if not rows:
-        return rows
-    df = pd.DataFrame(rows)
-    if "Family" not in df.columns or "return_4" not in df.columns:
-        return rows
-
-    sector_avg = df.groupby("Family")["return_4"].transform("mean")
-    df["peer_momentum"] = df["return_4"] - sector_avg
-    df["peer_rank"] = df.groupby("Family")["return_4"].rank(pct=True)
-
-    return df.to_dict("records")
-
-
-def run_scanner(config, force_regime=None, limit=0):
-    """
-    Live scanner mode using Binance API and all underlying analytical engines.
-    BUG #3/4/5 FIX: regime key case, double universe call, adaptive timing
-    GT #5: Momentum cluster detection
-    GT #6: MTF pre-pump score
-    """
-    load_false_signal_memory()
-    fetcher = BinanceFuturesFetcher()
-    logger.info("Polling active DeFi perp markets...")
-    universe = fetcher.get_defi_universe(config=config)
-    if not universe:
-        logger.error("Failed to load universe.")
-        return []
-
-    logger.info(f"Loaded {len(universe)} USDT perpetual contracts.")
-
-    # 1. Fetch TRUE MTF data for anchors
-    anchor_mtf = {}
-    logger.info("Fetching TRUE MTF context for anchors (BTC, ETH, AAVE, UNI)...")
-    for anchor in config.anchors:
-        anchor_mtf[anchor] = {}
-        for tf in ["15m", "1h", "4h"]:
-            df = fetcher.fetch_ohlcv(anchor, timeframe=tf, limit=150)
-            if not df.empty:
-                df = build_feature_pipeline(df)
-                anchor_mtf[anchor][tf] = df
-
-    # Initialize Engines
-    regime_engine = MarketRegimeEngine()
-    sector_engine = SectorRegimeEngine()
-    family_engine = FamilyEngine(config)
-    family_aggregator = FamilyAggregator(config.families)
-    discovery_engine = DiscoveryEngine(top_n=getattr(config.decision, "discovery_top_n", 10))
-    entry_trigger_engine = EntryEngine(min_readiness=getattr(config.decision, "min_entry_readiness", 65))
-    decision_engine = DecisionEngine(top_n=getattr(config.decision, "top_n", 5))
-    leadership_engine = LeadershipEngine(anchors=config.anchors, ema_lengths=[config.ema.fast, config.ema.medium])
-    adaptive_engine = AdaptiveWeightsEngine()
-
-    decay_engine = ExitDecayEngine(config=config)
-    paper_engine = PaperTradeEngine()
-    adaptive_stop_engine = AdaptiveStopEngine()
-    risk_engine = RiskEngine(config.risk.dict(), fetcher=fetcher)
-    broadcaster = SignalBroadcaster(config=config)
-    shadow_logger = ShadowLogger()
-
-    threshold_engine = ThresholdResolutionEngine(thresholds_config=config.regimes, config=config)
-    rule_engine = RuleEngine()
-
-    # 2. Evaluate Global Market Regime
-    btc_anchor = next((a for a in anchor_mtf if a.startswith("BTC")), None)
-    eth_anchor = next((a for a in anchor_mtf if a.startswith("ETH")), None)
-
-    if btc_anchor and eth_anchor:
-        global_regime_data = regime_engine.detect_regime(anchor_mtf[btc_anchor], anchor_mtf[eth_anchor])
-        regime_label = global_regime_data.get("label", "unknown")
-    else:
-        regime_label = "unknown"
-
-    # Fix #2: Respect force_regime override from UI
-    force_override = None
-    if hasattr(config.regimes, "overrides") and isinstance(config.regimes.overrides, dict):
-        force_override = config.regimes.overrides.get("force_regime")
-    if force_override and force_override != "Otomatik İzin Ver":
-        logger.info(f"[OVERRIDE] Regime forced from '{regime_label}' to '{force_override}' by UI.")
-        regime_label = force_override
-
-    # BUG #5 FIX: adaptive engine update AFTER regime_label is defined
-    adaptive_weights = adaptive_engine.current_weights
-    log_path = "logs/trade_performance.csv"
-    if os.path.exists(log_path):
         try:
-            perf_history = pd.read_csv(log_path)
-            did_rollback = adaptive_engine.evaluate_and_rollback(perf_history)
-            if did_rollback:
-                logger.info("[ADAPTIVE] Performance degradation detected — rolled back to best known weights.")
-            else:
-                adaptive_weights = adaptive_engine.update_weights(perf_history, current_regime=regime_label)
-                logger.info(f"[ADAPTIVE] Weights updated from {len(perf_history)} trade history records: {adaptive_weights}")
-        except Exception as e:
-            logger.error(f"[ADAPTIVE] Failed to process perf history: {e}. Using default weights.")
-    else:
-        logger.info("[ADAPTIVE] No performance log found. Using default weights.")
+            # 1. MTF Context for Anchors (Async)
+            await self._prepare_anchors()
 
-    # 3. Evaluate Sector Regime
-    sector_data = sector_engine.get_sector_regime(
-        anchor_mtf.get("ETH.p", {}).get("1h"),
-        anchor_mtf.get("AAVE.p", {}).get("1h"),
-        anchor_mtf.get("UNI.p", {}).get("1h"),
-    )
-    logger.info(f"Sector Alpha: {sector_data['label']} (Strongest: {sector_data['strongest_family']})")
+            # 2. Resolve Global Context
+            regime_label = self._resolve_regimes(force_regime)
+            adaptive_weights = self._update_adaptive_weights(regime_label)
+            sector_data = self._resolve_sector_regime()
 
-    rows = []
-    current_market_prices = {}
-    decay_signals = {}
-    timeframe = getattr(config, "timeframe", "15m")
+            # 3. Build Watchlist & Async Fetch RAW
+            watch_list = self._build_watchlist(limit)
+            raw_dfs = await self._fetch_raw_only_async(watch_list)
+            
+            # 4. PARALLEL FEATURE ENGINEERING
+            await self._process_features_parallel(raw_dfs)
 
-    # Load trained ML models
-    ml_engine = MLRankingEngine(model_dir=f"models_{timeframe}")
-    model_dir_path = f"models_{timeframe}"
-    trained_coins = []
-    if os.path.exists(model_dir_path):
-        trained_coins = [
-            f.replace("lgb_classifier_long_", "").replace("lgb_classifier_", "").replace(".pkl", "")
-            for f in os.listdir(model_dir_path)
-            if ("lgb_classifier_" in f) and ("GLOBAL" not in f) and ("calibrated" not in f)
-        ]
-
-    # BUG #4 FIX: Only slice/extend the already-fetched universe
-    top_movers = get_top_movers(fetcher, top_n=30)
-    logger.info(f"[GT #16] {len(top_movers)} pre-pump movers identified (1%-10% 24h change), scanning them first")
-
-    # GT-GOLD-3: RVR Pre-Scanner Filter + Anomaly Watchlist
-    from defihunter.data.universe import rank_by_relative_volume, build_anomaly_watchlist
-
-    universe_limited = universe[:200]
-    logger.info("[GT-GOLD-3] Running RVR pre-scan filter...")
-    rvr_top = rank_by_relative_volume(universe_limited, fetcher, timeframe="1h", lookback_bars=170, top_n=30)
-
-    anomaly_qualified = build_anomaly_watchlist(rvr_top + top_movers + config.anchors, fetcher)
-    logger.info(f"[GT-GOLD-3] Anomaly qualified: {len(anomaly_qualified)} coins after RVR+anomaly filter")
-
-    rest_of_universe = [s for s in universe_limited if s not in anomaly_qualified]
-    priority_set = list(dict.fromkeys(anomaly_qualified + rest_of_universe))
-    watch_list = priority_set if not limit else priority_set[:limit]
-
-    logger.info(f"Scanning universe and computing layered logic for {timeframe}...")
-
-    symbol_data_map = {}
-    data_lock = threading.Lock()
-
-    # PHASE 1: Parallel Data Fetching & Base Feature Generation
-    def fetch_and_prep(symbol):
-        try:
-            if should_skip_false_signal(symbol, _false_signal_memory):
-                return
-
-            df = fetcher.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
-            if df.empty or len(df) < 55:
-                return
-
-            df = build_feature_pipeline(df, timeframe=timeframe)
-
-            anchors_tf = {k: v[timeframe] for k, v in anchor_mtf.items() if timeframe in v}
-            df = leadership_engine.add_leadership_features(df, anchors_tf)
-
-            with data_lock:
-                symbol_data_map[symbol] = df
-                current_market_prices[symbol] = df.iloc[-1]["close"]
-
-        except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
-
-    max_workers = min(os.cpu_count() * 2, 20)
-    logger.info(f"[Phase 1] Parallelizing data fetch with {max_workers} workers...")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        executor.map(fetch_and_prep, watch_list)
-
-    # PHASE 2: Global Family Aggregation
-    logger.info("[Phase 2] Computing Global Family Aggregates...")
-    family_stats = family_aggregator.compute_family_stats(symbol_data_map, timeframe=timeframe)
-
-    # PHASE 3: Parallel Logic Evaluation
-    all_rows = []
-    rows_lock = threading.Lock()
-
-    def evaluate_logic(symbol):
-        try:
-            df = symbol_data_map[symbol]
-
-            df = family_aggregator.inject_family_features(symbol, df, family_stats, timeframe=timeframe)
-
-            decay_res = decay_engine.evaluate_exit_signals(symbol, df)
-            with data_lock:
-                decay_signals[symbol] = decay_res
-
-            profile = family_engine.profile_coin(symbol, historical_data=df)
-            resolved_thresholds = threshold_engine.resolve_thresholds(regime=regime_label, family=profile.family_label)
-            df = rule_engine.evaluate(
-                df,
-                regime=regime_label,
-                family=profile.family_label,
-                resolved_thresholds=resolved_thresholds,
+            # 5. EXECUTE SIGNAL CORE (Unified Pipeline)
+            pipeline_result = self.signal_core.run(
+                symbol_data_map=self.symbol_data_map,
+                anchor_context=self.anchor_mtf,
+                regime_label=regime_label,
                 sector_data=sector_data,
                 adaptive_weights=adaptive_weights,
-                primary_anchor=profile.primary_anchor,
+                mode="live"
             )
 
-            if df.empty:
-                return
+            # 5. EXECUTION & SIDE EFFECTS
+            self._evaluate_exits_parallel()
+            executed_decisions = self._execute_decisions(pipeline_result)
 
-            last_bar = df.tail(1).to_dict("records")[0]
-            last_bar.update({
-                "symbol": symbol,
-                "family": profile.family_label,
-                "regime": regime_label,
-                "_atr": float(df.iloc[-1].get("atr", 0.0)),
-                "_close_raw": float(df.iloc[-1].get("close", 0.0)),
-            })
-            with rows_lock:
-                all_rows.append(last_bar)
-
-        except Exception as e:
-            logger.error(f"Error evaluating {symbol}: {e}")
-
-    print(f"[Phase 1] Evaluating logic with {max_workers} workers...")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        executor.map(evaluate_logic, list(symbol_data_map.keys()))
-
-    master_df = pd.DataFrame(all_rows)
-
-    if master_df.empty:
-        logger.info("No candidates found in current scan.")
-        return []
-
-    # --- LAYERED PIPELINE CONTINUES ---
-    master_df = compute_family_features(master_df)
-
-    # 4. ML Leader Components
-    logger.info("\n[ML] Predicting Leader Prob, Setup Quality, and Holdability...")
-
-    def _safe_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
-        if col in df.columns:
-            return (
-                pd.to_numeric(df[col], errors="coerce")
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(default)
-            )
-        return pd.Series(default, index=df.index, dtype=float)
-
-    def _norm01(s: pd.Series, neutral: float = 0.5) -> pd.Series:
-        s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if s.notna().sum() == 0:
-            return pd.Series(neutral, index=s.index, dtype=float)
-
-        fill_val = float(s.median()) if s.notna().any() else neutral
-        s = s.fillna(fill_val)
-
-        lo = float(s.min())
-        hi = float(s.max())
-        if (not np.isfinite(lo)) or (not np.isfinite(hi)) or abs(hi - lo) < 1e-12:
-            return pd.Series(neutral, index=s.index, dtype=float)
-
-        return (s - lo) / (hi - lo)
-
-    ml_meta = {}
-    try:
-        master_df, _ = ml_engine.rank_candidates(master_df, use_family_ranker=True)
-    except Exception as e:
-        logger.warning(f"[ML Contract] rank_candidates failed: {e}. Ensuring canonical columns via fallback.", exc_info=True)
-        master_df = ml_engine.ensure_canonical_columns(master_df)
-
-    # 5 & 6. Discovery + Decision Layer
-    logger.info("[Discovery] Identifying leader candidates...")
-    final_decisions = decision_engine.process_candidates(master_df)
-
-    # Context maps for ShadowLogger
-    adaptive_stop_map = {}
-    kelly_map = {}
-    paper_opened = set()
-    setup_class_map = {} # Can be populated if needed
-
-    # Update Paper Positions
-    paper_engine.update_positions(current_market_prices, decay_signals=decay_signals)
-
-    # 7. RISK FILTERING & Execution
-    executed_decisions = []
-
-    # GT #18: Daily Loss Killswitch Wiring (Unrealized-aware)
-    daily_loss_pct = paper_engine.get_daily_loss_pct(current_market_prices)
-
-    for d in final_decisions:
-        current_portfolio_list = [p.dict() for p in paper_engine.portfolio.open_positions]
-
-        if d.decision == "trade":
-            family_label = d.explanation.get("family", "defi_beta")
-
-            # ── Family Execution Mode ──────────────────────────────────────
-            exec_cfg = config.get_family_execution(family_label) if hasattr(config, "get_family_execution") else None
-            exec_mode = getattr(exec_cfg, "mode", "trade_allowed") if exec_cfg else "trade_allowed"
-            width_mult = getattr(exec_cfg, "stop_width_mult", 1.0) if exec_cfg else 1.0
-
-            # watch_only: log to shadow, skip trade
-            if exec_mode == "watch_only":
-                logger.info(f"[WatchOnly] {d.symbol} ({family_label}) — candidate logged, no trade opened")
-                d.explanation["participation_mode"] = "watch_only"
-                executed_decisions.append(d)
-                continue
-
-            # ── Kelly first ───────────────────────────────────────────────
-            win_prob = d.leader_prob if d.leader_prob > 0 else 0.5
-            kelly_pct = risk_engine.calculate_kelly_size(
-                win_prob=win_prob,
-                reward_risk=2.0,
-                leader_prob=d.leader_prob,
-            )
-
-            # reduced_risk: apply gates BEFORE risk validation
-            if exec_cfg and exec_mode == "reduced_risk":
-                min_er = getattr(exec_cfg, "min_entry_readiness", 0.0)
-                min_lp = getattr(exec_cfg, "min_leader_prob", 0.0)
-                max_pos = getattr(exec_cfg, "max_open_positions", 5)
-
-                family_open = sum(
-                    1 for p in paper_engine.portfolio.open_positions
-                    if p.family == family_label
-                )
-
-                if d.entry_readiness < min_er:
-                    d.decision = "reject"
-                    d.explanation["rejection_reason"] = (
-                        f"reduced_risk: entry_readiness {d.entry_readiness:.1f} < {min_er}"
-                    )
-                    executed_decisions.append(d)
-                    continue
-
-                if d.leader_prob < min_lp:
-                    d.decision = "reject"
-                    d.explanation["rejection_reason"] = (
-                        f"reduced_risk: leader_prob {d.leader_prob:.2f} < {min_lp}"
-                    )
-                    executed_decisions.append(d)
-                    continue
-
-                if family_open >= max_pos:
-                    d.decision = "reject"
-                    d.explanation["rejection_reason"] = (
-                        f"reduced_risk: {family_label} already has {family_open}/{max_pos} positions"
-                    )
-                    executed_decisions.append(d)
-                    continue
-
-                risk_pct_mult = getattr(exec_cfg, "risk_pct_mult", 1.0)
-                kelly_pct *= risk_pct_mult
-
-            d.explanation["participation_mode"] = exec_mode
-
-            # ── Adaptive Stop ─────────────────────────────────────────────
-            adaptive_stop_result = None
-            try:
-                sym_rows = master_df[master_df["symbol"] == d.symbol]
-                atr_val = float(sym_rows["_atr"].iloc[-1]) if "_atr" in sym_rows.columns and not sym_rows.empty else 0.0
-                close_val = float(sym_rows["_close_raw"].iloc[-1]) if "_close_raw" in sym_rows.columns and not sym_rows.empty else d.entry_price
-
-                stop_row = {
-                    "close": close_val,
-                    "atr": atr_val,
-                    "structure_low": float(sym_rows.get("structure_low", pd.Series([0.0])).iloc[-1]) if "structure_low" in sym_rows.columns else 0.0,
-                    "swing_low": float(sym_rows.get("swing_low", pd.Series([0.0])).iloc[-1]) if "swing_low" in sym_rows.columns else 0.0,
-                    "support_level": float(sym_rows.get("support_level", pd.Series([0.0])).iloc[-1]) if "support_level" in sym_rows.columns else 0.0,
-                }
-
-                adaptive_stop_result = adaptive_stop_engine.compute_stop(
-                    row=stop_row,
-                    family=family_label,
-                    regime=regime_label,
-                    fakeout_risk=d.fakeout_risk,
-                    stop_width_mult=width_mult,
-                )
-
-                logger.info(
-                    f"[AdaptiveStop-V2] {d.symbol} | "
-                    f"mode={exec_mode} | "
-                    f"stop_mode={adaptive_stop_result['stop_mode']} | "
-                    f"atr_mult={adaptive_stop_result['atr_mult']} | "
-                    f"family={family_label} | regime={regime_label} | "
-                    f"hard_stop={adaptive_stop_result['stop_price']:.6f} | "
-                    f"soft_stop={adaptive_stop_result['soft_invalidation_price']:.6f} | "
-                    f"tp1={adaptive_stop_result['tp1_price']:.6f} | "
-                    f"confidence={adaptive_stop_result.get('stop_confidence', '?')} | "
-                    f"noise_bars={adaptive_stop_result.get('noise_tolerance_bars', '?')} | "
-                    f"reduce_size_first={adaptive_stop_result.get('reduce_size_first', False)}"
-                )
-            except Exception as _stop_err:
-                logger.warning(
-                    f"[AdaptiveStop-V2] compute_stop failed for {d.symbol}: {_stop_err} — using legacy fallback",
-                    exc_info=True,
-                )
-                adaptive_stop_result = None
-
-            # ── Determine stop price for sizing ──────────────────────────
-            stop_price_for_sizing = (
-                adaptive_stop_result["stop_price"]
-                if adaptive_stop_result and adaptive_stop_result.get("stop_price")
-                else d.stop_price
-            )
-
-            # ── Estimate REAL notional from risk + stop distance ────────
-            actual_notional = risk_engine.estimate_notional_from_stop(
-                equity_val=paper_engine.portfolio.balance_usd,
-                risk_pct=kelly_pct,
-                entry_price=d.entry_price,
-                stop_price=stop_price_for_sizing,
-            )
-
-            if actual_notional <= 0:
-                d.decision = "reject"
-                d.explanation["rejection_reason"] = "invalid_sizing_notional"
-                executed_decisions.append(d)
-                continue
-
-            d.explanation["kelly_risk_pct"] = kelly_pct
-            d.explanation["estimated_notional"] = actual_notional
-
-            # ── NOW run risk validation with REAL values ────────────────
-            is_valid, reason = risk_engine.validate_trade(
-                symbol=d.symbol,
-                family=family_label,
-                current_portfolio=current_portfolio_list,
-                equity_val=paper_engine.portfolio.balance_usd,
-                daily_loss_pct=daily_loss_pct,
-                leader_prob=d.leader_prob,
-                new_trade_notional=actual_notional,
-                leverage=getattr(config.risk, "default_leverage", None),
-            )
-
-            if not is_valid:
-                d.decision = "reject"
-                d.explanation["rejection_reason"] = reason
-                executed_decisions.append(d)
-                continue
-
-            d.explanation["leverage"] = getattr(config.risk, "default_leverage", None)
-
-            paper_engine.open_position(
-                d,
-                risk_pct=kelly_pct,
-                adaptive_stop_result=adaptive_stop_result,
-            )
+            elapsed = time.time() - start_t
+            logger.info(f"Scan completed in {elapsed:.1f}s. Portfolio: ${self.paper_engine.portfolio.balance_usd:.2f}")
             
-            # Update context maps
-            paper_opened.add(d.symbol)
-            kelly_map[d.symbol] = kelly_pct
-            if adaptive_stop_result:
-                adaptive_stop_map[d.symbol] = adaptive_stop_result
+            # 6. PERSISTENCE & MONITORING
+            try:
+                db_manager.log_scan(
+                    timestamp=datetime.now(),
+                    regime=regime_label,
+                    universe_size=len(self.symbol_data_map),
+                    duration_ms=elapsed * 1000,
+                    balance=self.paper_engine.portfolio.balance_usd
+                )
+                monitor.report_scan(
+                    duration_ms=elapsed * 1000,
+                    universe_size=len(self.symbol_data_map),
+                    fallbacks=0 # We'll need to bubble this up from ml_engine later
+                )
+            except Exception as e:
+                logger.warning(f"[Scanner] DB/Monitor logging failed: {e}")
 
-        executed_decisions.append(d)
 
-    # GT-GOLD: Save rich shadow log
-    shadow_logger.log_scan(
-        decisions=executed_decisions,
-        regime=regime_label,
-        universe_size=len(watch_list),
-        timeframe=timeframe,
-        adaptive_stop_map=adaptive_stop_map,
-        paper_opened_symbols=paper_opened,
-        kelly_map=kelly_map,
-        setup_class_map={d.symbol: d.setup_class for d in executed_decisions if hasattr(d, 'setup_class')}
-    )
+            save_false_signal_memory()
+            return executed_decisions
+        finally:
+            await self.fetcher.close()
 
-    # DISPLAY NEW LEADERBOARD
-    display_rows = []
-    for dec in executed_decisions:
-        display_rows.append({
-            "Symbol": dec.symbol,
-            "Family": dec.explanation.get("family", "—"),
-            "Disc_S": round(dec.discovery_score, 1),
-            "Ready_S": round(dec.entry_readiness, 1),
-            "Risk_F": round(dec.fakeout_risk, 1),
-            "Hold_Q": round(dec.hold_quality, 1),
-            "L_Prob": f"{dec.leader_prob * 100:.0f}%",
-            "Comp_S": round(dec.composite_leader_score, 1),
-            "Action": dec.decision,
-            "Entry": round(dec.entry_price, 4),
-            "Timestamp": dec.timestamp.strftime("%H:%M:%S") if dec.timestamp else "—",
-        })
+    async def _prepare_anchors(self):
+        logger.info("Fetching Anchor MTF Context (Async)...")
+        tasks = []
+        for anchor in self.config.anchors:
+            self.anchor_mtf[anchor] = {}
+            for tf in ["15m", "1h", "4h"]:
+                tasks.append(self._fetch_and_prep_anchor(anchor, tf))
+        await asyncio.gather(*tasks)
 
-    final_display_df = pd.DataFrame(display_rows)
-    logger.info("\n[PHASE 5: LAYERED DECISION ENGINE ACTIVE]")
-    if not final_display_df.empty:
-        logger.info("\n" + final_display_df.sort_values("Comp_S", ascending=False).to_markdown(index=False))
+    async def _fetch_and_prep_anchor(self, anchor, tf):
+        df = await self.fetcher.async_fetch_ohlcv(anchor, timeframe=tf, limit=150)
+        if not df.empty:
+            df = build_feature_pipeline(df, timeframe=tf)
+            self.anchor_mtf[anchor][tf] = df
 
-    logger.info(
-        f"\n[PAPER PORTFOLIO] Balance: ${paper_engine.portfolio.balance_usd:.2f} | "
-        f"Open: {len(paper_engine.portfolio.open_positions)}"
-    )
 
-    # BROADCAST ALERTS
-    try:
-        broadcaster.broadcast(executed_decisions)
-    except Exception as e:
-        logger.error(f"[Broadcaster] Error during signal broadcast: {e}")
+    def _resolve_regimes(self, force_regime: Optional[str]) -> str:
+        # Use SignalPipeline's helper but allow forced override
+        resolved = self.signal_core._resolve_regime(self.anchor_mtf)
+        
+        force_from_cfg = None
+        if hasattr(self.config.regimes, "overrides") and isinstance(self.config.regimes.overrides, dict):
+            force_from_cfg = self.config.regimes.overrides.get("force_regime")
+        
+        final_regime = force_regime or force_from_cfg
+        if final_regime and final_regime != "Otomatik İzin Ver":
+            logger.info(f"[Regime] Overridden to {final_regime}")
+            return final_regime
+        return resolved
 
-    save_false_signal_memory()
-    return executed_decisions
+    def _update_adaptive_weights(self, regime_label: str) -> dict:
+        try:
+            perf_history = db_manager.get_trade_history(limit=500)
+            if not perf_history.empty:
+                if self.adaptive_engine.evaluate_and_rollback(perf_history):
+                    return self.adaptive_engine.current_weights
+                return self.adaptive_engine.update_weights(perf_history, current_regime=regime_label)
+        except Exception as e:
+            logger.error(f"[Adaptive] Error reading from DB: {e}")
+            
+        # Fallback to CSV if DB is empty or fails (optional during migration)
+        # return self.adaptive_engine.current_weights
+        return self.adaptive_engine.current_weights
+
+
+    def _resolve_sector_regime(self) -> dict:
+        return self.signal_core._resolve_sector_regime(self.anchor_mtf)
+
+    def _build_watchlist(self, limit: int) -> list:
+        from defihunter.data.universe import rank_by_relative_volume, build_anomaly_watchlist
+        universe = self.fetcher.get_defi_universe(config=self.config)
+        top_movers = self._get_top_movers(top_n=30)
+        u_lim = universe[:200]
+        rvr_top = rank_by_relative_volume(u_lim, self.fetcher, timeframe="1h", lookback_bars=170, top_n=30)
+        anomaly_q = build_anomaly_watchlist(rvr_top + top_movers + self.config.anchors, self.fetcher)
+        full_list = list(dict.fromkeys(anomaly_q + [s for s in u_lim if s not in anomaly_q]))
+        return full_list if not limit else full_list[:limit]
+
+    def _get_top_movers(self, top_n: int = 30) -> list:
+        try:
+            tickers = self.fetcher.exchange.fetch_tickers()
+            movers = []
+            for sym, t in tickers.items():
+                if "/USDT:USDT" in sym or sym.endswith("/USDT"):
+                    pct = t.get("percentage") or t.get("change") or 0
+                    base = sym.split("/")[0]
+                    movers.append((f"{base}.p", float(pct)))
+            pre_pump = [(s, p) for s, p in movers if 1.0 < p < 10.0]
+            pre_pump.sort(key=lambda x: -x[1])
+            return [s for s, _ in pre_pump[:top_n]]
+        except Exception as e:
+            logger.error(f"[Movers] Error: {e}")
+            return []
+
+    async def _fetch_raw_only_async(self, watch_list: list) -> Dict[str, pd.DataFrame]:
+        """Asynchronously fetch OHLCV for all symbols without processing features yet."""
+        tasks = {symbol: self.fetcher.async_fetch_ohlcv(symbol, timeframe=self.timeframe, limit=200) 
+                 for symbol in watch_list if not self._should_skip(symbol)}
+        
+        results = await asyncio.gather(*tasks.values())
+        return {symbol: df for symbol, df in zip(tasks.keys(), results) if not df.empty and len(df) >= 55}
+
+    async def _process_features_parallel(self, raw_dfs: Dict[str, pd.DataFrame]):
+        """Runs build_feature_pipeline in parallel across multiple processes."""
+        if not raw_dfs:
+            return
+
+        logger.info(f"Processing features for {len(raw_dfs)} symbols in parallel...")
+        symbols = list(raw_dfs.keys())
+        dfs = list(raw_dfs.values())
+        
+        # Parallel execution using ProcessPoolExecutor
+        processed_dfs = await self.loop.run_in_executor(
+            _executor, 
+            self._batch_build_features, 
+            dfs, 
+            self.timeframe
+        )
+        
+        for symbol, df in zip(symbols, processed_dfs):
+            self.symbol_data_map[symbol] = df
+            self.current_market_prices[symbol] = df.iloc[-1]["close"]
+            self.current_market_highs[symbol] = df.iloc[-1]["high"]
+            self.current_market_lows[symbol] = df.iloc[-1]["low"]
+
+    @staticmethod
+    def _batch_build_features(dfs: List[pd.DataFrame], timeframe: str) -> List[pd.DataFrame]:
+        """Static helper to process a list of DataFrames (runs in worker process)."""
+        from defihunter.data.features import build_feature_pipeline
+        return [build_feature_pipeline(df, timeframe=timeframe) for df in dfs]
+
+
+    def _should_skip(self, symbol: str) -> bool:
+        rec = _false_signal_memory.get(symbol, {})
+        if rec.get("count", 0) >= FALSE_SIGNAL_MAX_FAILS and not rec.get("hit", False):
+            if (rec.get("current_bar", 0) - rec.get("last_scan_bar", 0)) < FALSE_SIGNAL_COOLDOWN_BARS:
+                return True
+        return False
+
+    def _evaluate_exits_parallel(self):
+        # Exit evaluation (not in SignalPipeline core)
+        for symbol, df in self.symbol_data_map.items():
+            self.decay_signals[symbol] = self.decay_engine.evaluate_exit_signals(symbol, df)
+
+    def _execute_decisions(self, res) -> list:
+        # Update existing positions with full High/Low awareness
+        self.paper_engine.update_positions(
+            self.current_market_prices, 
+            decay_signals=self.decay_signals,
+            current_highs=self.current_market_highs,
+            current_lows=self.current_market_lows
+        )
+        
+        executed = []
+        daily_loss = self.paper_engine.get_daily_loss_pct(self.current_market_prices)
+        
+        for d in res.final_decisions:
+            if d.decision == "trade":
+                self._handle_trade_decision(d, res.regime_label, daily_loss, res.master_df)
+            executed.append(d)
+            
+        self._finalize_scan(executed, res.regime_label, len(self.symbol_data_map))
+        return executed
+
+    def _handle_trade_decision(self, d, regime, daily_loss, master_df):
+        fam = d.explanation.get("family", "defi_beta")
+        exec_cfg = self.config.get_family_execution(fam) if hasattr(self.config, "get_family_execution") else None
+        mode = getattr(exec_cfg, "mode", "trade_allowed") if exec_cfg else "trade_allowed"
+        
+        if mode == "watch_only":
+            d.explanation["participation_mode"] = "watch_only"
+            return
+
+        # Risk & Sizing
+        kelly = self.risk_engine.calculate_kelly_size(win_prob=d.leader_prob or 0.5, reward_risk=2.0, leader_prob=d.leader_prob)
+        
+        # Adaptive Stop
+        sym_rows = master_df[master_df["symbol"] == d.symbol]
+        atr = float(sym_rows["_atr"].iloc[-1]) if not sym_rows.empty else 0.0
+        
+        stop_result = self.adaptive_stop_engine.compute_stop(
+            row={"close": d.entry_price, "atr": atr}, family=fam, regime=regime, 
+            fakeout_risk=d.fakeout_risk, stop_width_mult=getattr(exec_cfg, "stop_width_mult", 1.0)
+        )
+        
+        notional = self.risk_engine.estimate_notional_from_stop(
+            equity_val=self.paper_engine.portfolio.balance_usd, risk_pct=kelly,
+            entry_price=d.entry_price, stop_price=stop_result["stop_price"]
+        )
+        
+        is_val, reason = self.risk_engine.validate_trade(
+            symbol=d.symbol, family=fam, current_portfolio=[p.dict() for p in self.paper_engine.portfolio.open_positions],
+            equity_val=self.paper_engine.portfolio.balance_usd, daily_loss_pct=daily_loss,
+            leader_prob=d.leader_prob, new_trade_notional=notional
+        )
+        
+        if is_val:
+            self.paper_engine.open_position(d, risk_pct=kelly, adaptive_stop_result=stop_result)
+            self.paper_opened.add(d.symbol)
+            self.kelly_map[d.symbol] = kelly
+            self.adaptive_stop_map[d.symbol] = stop_result
+        else:
+            d.decision, d.explanation["rejection_reason"] = "reject", reason
+
+    def _finalize_scan(self, executed, regime, watch_size):
+        self.shadow_logger.log_scan(
+            decisions=executed,
+            regime=regime,
+            universe_size=watch_size,
+            timeframe=self.timeframe,
+            adaptive_stop_map=self.adaptive_stop_map,
+            paper_opened_symbols=self.paper_opened,
+            kelly_map=self.kelly_map,
+            setup_class_map={d.symbol: getattr(d, 'setup_class', 'unknown') for d in executed}
+        )
+        
+        display_rows = []
+        for dec in executed:
+            display_rows.append({
+                "Symbol": dec.symbol,
+                "Family": dec.explanation.get("family", "—"),
+                "Disc_S": round(dec.discovery_score, 1),
+                "Ready_S": round(dec.entry_readiness, 1),
+                "Risk_F": round(dec.fakeout_risk, 1),
+                "L_Prob": f"{dec.leader_prob * 100:.0f}%",
+                "Comp_S": round(dec.composite_leader_score, 1),
+                "Action": dec.decision,
+                "Entry": round(dec.entry_price, 4),
+            })
+        
+        df = pd.DataFrame(display_rows)
+        if not df.empty:
+            logger.info("\n[LEADERBOARD]\n" + df.sort_values("Comp_S", ascending=False).to_markdown(index=False))
+            
+        self.broadcaster.broadcast(executed)
+
+async def run_scanner(config, force_regime=None, limit=0):
+    pipeline = ScanPipeline(config)
+    return await pipeline.run(force_regime=force_regime, limit=limit)

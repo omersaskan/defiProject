@@ -1,7 +1,12 @@
-from typing import Optional
+from typing import Optional, Any
+from defihunter.utils.structured_logger import s_logger
 
 class RiskEngine:
-    def __init__(self, config: dict, fetcher=None):
+    def __init__(self, config: dict, fetcher: Optional[Any] = None):
+        """
+        GT-Institutional: Risk Engine with Dependency Injection.
+        fetcher: The data fetcher used for correlation analysis. (Optional but recommended)
+        """
         self.max_open_positions = config.get("max_open_positions", 5)
         self.max_correlated_exposure = config.get("max_correlated_exposure", 2)
         self.max_risk_per_trade_pct = config.get("max_risk_per_trade_pct", 1.0)
@@ -10,11 +15,8 @@ class RiskEngine:
         self.max_avg_correlation = config.get("max_avg_correlation", 0.70)
         self.kelly_fraction = config.get("kelly_fraction", 0.25)
         self.default_leverage = config.get("default_leverage", 5.0)
-
+        
         from defihunter.engines.portfolio import CorrelationEngine
-        if fetcher is None:
-            from defihunter.data.binance_fetcher import BinanceFuturesFetcher
-            fetcher = BinanceFuturesFetcher()
         self.corr_engine = CorrelationEngine(fetcher=fetcher)
 
     def calculate_kelly_size(
@@ -82,9 +84,6 @@ class RiskEngine:
     ) -> tuple[bool, str]:
         """
         Dynamic Position Manager with leadership awareness.
-
-        IMPORTANT:
-        new_trade_notional must be the ACTUAL size derived from Kelly + stop distance.
         """
         from defihunter.utils.logger import logger
 
@@ -152,9 +151,10 @@ class RiskEngine:
         # Leave liquidation buffer
         max_margin = equity_val * (1.0 - self.liquidation_buffer)
         if total_margin_req > max_margin:
-            return False, (
-                f"insufficient_margin_buffer "
-                f"(using {total_margin_req:.1f}$ of max {max_margin:.1f}$)"
-            )
+            reason = (f"insufficient_margin_buffer "
+                      f"(using {total_margin_req:.1f}$ of max {max_margin:.1f}$)")
+            s_logger.log("RiskEngine", "TRADE_REJECTED", symbol=symbol, data={"reason": reason})
+            return False, reason
 
-        return True, ""
+        s_logger.log("RiskEngine", "TRADE_ACCEPTED", symbol=symbol, data={"family": family, "notional": new_trade_notional})
+        return True, ""

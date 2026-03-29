@@ -1,8 +1,10 @@
 import json
 import os
 from defihunter.utils.logger import logger
+from defihunter.utils.trade_utils import TradeUtils
 from datetime import datetime
 from typing import List, Dict, Any
+from defihunter.utils.db_manager import db_manager
 from pydantic import BaseModel, Field
 
 class PaperPosition(BaseModel):
@@ -21,6 +23,11 @@ class PaperPosition(BaseModel):
     max_favorable_excursion: float = 0.0
     giveback: float = 0.0
     exit_reason: str = ""
+    bars_held: int = 0
+    regime: str = "unknown"
+    setup_class: str = "unknown"
+    risk_pct: float = 0.0
+
 
 class PaperPortfolio(BaseModel):
     balance_usd: float = 10000.0
@@ -129,7 +136,11 @@ class PaperTradeEngine:
             entry_time=datetime.now().isoformat(),
             family=family,
             peak_price_seen=decision.entry_price,
+            regime=getattr(decision, 'regime_label', 'unknown'),
+            setup_class=getattr(decision, 'setup_class', 'unknown'),
+            risk_pct=risk_pct
         )
+
 
         self.portfolio.open_positions.append(new_pos)
         self.portfolio.last_update = datetime.now().isoformat()
@@ -137,13 +148,24 @@ class PaperTradeEngine:
         logger.info(f"Paper Trade Opened: {decision.symbol} at {decision.entry_price} | stop={stop_p:.4f} | tp1={tp1_p:.4f}")
         return True
 
-    def update_positions(self, current_prices: Dict[str, float], decay_signals: Dict[str, Any] = None):
+    def update_positions(
+        self, 
+        current_prices: Dict[str, float], 
+        decay_signals: Dict[str, Any] = None,
+        current_highs: Dict[str, float] = None,
+        current_lows: Dict[str, float] = None
+    ):
         """
-        GT-REDESIGN: Check open positions for SL/TP/Runner/Decay.
-        Supports Partial Take Profit at TP1. Ensures robust state saving.
+        GT-REDESIGN: Unified Management logic via ManagementCore.
+        Now supports High/Low awareness for intra-bar SL/TP parity.
         """
-        if decay_signals is None:
-            decay_signals = {}
+        from defihunter.execution.manager import ManagementCore, ManagementAction, PositionStatus
+        
+        core = ManagementCore(config=getattr(self, "config", None))
+        decay_signals = decay_signals or {}
+        current_highs = current_highs or {}
+        current_lows = current_lows or {}
+        
         state_changed = False
         remaining_positions = []
         
@@ -153,74 +175,87 @@ class PaperTradeEngine:
                 continue
                 
             curr_price = current_prices[pos.symbol]
-            if curr_price > pos.peak_price_seen:
-                pos.peak_price_seen = curr_price
-                if pos.entry_price > 0:
-                    pos.max_favorable_excursion = (pos.peak_price_seen - pos.entry_price) / pos.entry_price
-                state_changed = True
-                
-            closed = False
+            curr_high = current_highs.get(pos.symbol)
+            curr_low = current_lows.get(pos.symbol)
             
-            # 1. Decay Exit Check (Highest Priority Patch 2)
-            if decay_signals.get(pos.symbol, {}).get("exit_signal", False):
-                pos.status = "closed_decay"
-                pos.exit_reason = decay_signals[pos.symbol].get("exit_reason", "Decay")
-                closed = True
-                pnl = (curr_price / pos.entry_price - 1) * pos.size_usd
-                self.portfolio.balance_usd += pnl
-                logger.info(f"Paper Decay Exit: {pos.symbol} at {curr_price} (Reason: {pos.exit_reason})")
-
-            # 2. Stop Loss Check
-            elif curr_price <= pos.stop_price:
-                pos.status = "closed_sl"
-                pos.exit_reason = "Stop Loss Hit"
-                closed = True
-                pnl = (pos.stop_price / pos.entry_price - 1) * pos.size_usd
-                self.portfolio.balance_usd += pnl
-                logger.info(f"Paper SL Hit: {pos.symbol} at {curr_price} (PnL: ${pnl:.2f})")
-                
-            # 3. TP1 Check (Partial Take Profit)
-            elif pos.status == "open" and curr_price >= pos.tp1_price:
-                # Sell half (or runner_size_pct complement)
-                sell_ratio = (100.0 - pos.runner_size_pct) / 100.0
-                pnl_realized = (pos.tp1_price / pos.entry_price - 1) * (pos.size_usd * sell_ratio)
-                self.portfolio.balance_usd += pnl_realized
-                
-                # Update remaining position to "runner"
-                pos.status = "runner"
-                pos.partial_taken = True
-                pos.size_usd *= (pos.runner_size_pct / 100.0)
-                # Move SL to breakeven for the runner
-                pos.stop_price = pos.entry_price
+            pos.bars_held += 1
+            
+            # Peak tracking (conservative: use high if available)
+            high_to_peak = curr_high if curr_high is not None else curr_price
+            if high_to_peak > pos.peak_price_seen:
+                pos.peak_price_seen = high_to_peak
+                pos.max_favorable_excursion = (pos.peak_price_seen - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
                 state_changed = True
-                logger.info(f"Paper TP1 Hit (Partial): {pos.symbol} at {curr_price}. Runner active.")
-
-            # 4. TP2 Check (Final TP for runner) & Trailing Stop
-            elif pos.status == "runner":
-                if curr_price >= pos.tp2_price:
-                    pos.status = "closed_tp"
-                    pos.exit_reason = "Final TP Hit"
-                    closed = True
-                    pnl = (pos.tp2_price / pos.entry_price - 1) * pos.size_usd
-                    self.portfolio.balance_usd += pnl
-                    logger.info(f"Paper TP2 Hit: {pos.symbol} at {curr_price} (PnL: ${pnl:.2f})")
-                else:
-                    # Trailing Stop Logic (Patch 2)
-                    reward_dist = pos.tp2_price - pos.entry_price
-                    activation_price = pos.entry_price + (reward_dist * 0.3)
-                    if pos.peak_price_seen > activation_price:
-                        # Trail 20% of reward distance behind peak
-                        new_stop = pos.peak_price_seen - (reward_dist * 0.2)
-                        if new_stop > pos.stop_price:
-                            pos.stop_price = new_stop
-                            state_changed = True
-
-            if closed:
-                if pos.peak_price_seen > 0:
-                    pos.giveback = (pos.peak_price_seen - curr_price) / pos.entry_price
+            
+            # Delegate to Unified ManagementCore
+            res = core.evaluate(
+                symbol=pos.symbol,
+                current_price=curr_price,
+                current_high=curr_high,
+                current_low=curr_low,
+                position_state=pos.model_dump(),
+                decay_signal=decay_signals.get(pos.symbol),
+                bars_held=pos.bars_held
+            )
+            
+            if res.action == ManagementAction.FULL_EXIT:
+                exit_p = res.exit_price or curr_price
+                pos.status = res.new_status or "closed"
+                pos.exit_reason = res.exit_reason or "EXIT"
+                
+                # Use Unified TradeUtils
+                pnl = TradeUtils.calculate_pnl_usd(
+                    entry_price=pos.entry_price,
+                    exit_price=exit_p,
+                    size_usd=pos.size_usd
+                )
+                self.portfolio.balance_usd += pnl
+                pos.giveback = (pos.peak_price_seen - exit_p) / pos.entry_price if pos.entry_price > 0 else 0
+                
                 self.portfolio.trade_history.append(pos)
                 state_changed = True
-            else:
+                logger.info(f"Paper Exit: {pos.symbol} at {exit_p} (Reason: {pos.exit_reason}, PnL: ${pnl:.2f})")
+                
+                # DB Logging
+                try:
+                    pos_dict = pos.model_dump()
+                    pos_dict['exit_price'] = exit_p
+                    db_manager.log_trade(pos_dict)
+                except Exception as e:
+                    logger.error(f"[PaperTrade] DB logging failed: {e}")
+
+                
+            elif res.action == ManagementAction.PARTIAL_EXIT:
+                # Realize PnL for the exited portion
+                realized_ratio = res.realized_pct / 100.0
+                exit_p = res.exit_price or curr_price
+                
+                # Use Unified TradeUtils
+                pnl_realized = TradeUtils.calculate_pnl_usd(
+                    entry_price=pos.entry_price,
+                    exit_price=exit_p,
+                    size_usd=pos.size_usd * realized_ratio
+                )
+                self.portfolio.balance_usd += pnl_realized
+                
+                # Update remaining runner
+                pos.status = "runner"
+                pos.partial_taken = True
+                pos.size_usd *= (1.0 - realized_ratio)
+                if res.new_stop_price:
+                    pos.stop_price = res.new_stop_price
+                
+                remaining_positions.append(pos)
+                state_changed = True
+                logger.info(f"Paper TP1 Hit (Partial): {pos.symbol} at {exit_p}. Runner active.")
+                
+            elif res.action == ManagementAction.UPDATE_STOP:
+                if res.new_stop_price:
+                    pos.stop_price = res.new_stop_price
+                    state_changed = True
+                remaining_positions.append(pos)
+                
+            else: # NO_ACTION
                 remaining_positions.append(pos)
                 
         if state_changed:

@@ -7,7 +7,21 @@ class ThresholdResolutionEngine:
         self.thresholds_config = thresholds_config
         self.config = config
         self.adaptive_path = adaptive_path
-        
+        self._adaptive_cache = {}
+        self._load_adaptive_config()
+
+    def _load_adaptive_config(self):
+        """Pre-load adaptive thresholds to avoid repeated disk I/O during scan loops."""
+        if self.adaptive_path and os.path.exists(self.adaptive_path):
+            try:
+                with open(self.adaptive_path, 'r') as f:
+                    data = yaml.safe_load(f)
+                    if isinstance(data, dict) and 'current_thresholds' in data:
+                        self._adaptive_cache = data['current_thresholds']
+                        logger.info(f"[Thresholds] Adaptive config loaded from {self.adaptive_path}")
+            except Exception as e:
+                logger.error(f"Failed to load adaptive thresholds from {self.adaptive_path}: {e}")
+
     def resolve_thresholds(self, regime: str, family: str) -> dict:
         """
         Resolves thresholds based on precedence:
@@ -15,9 +29,9 @@ class ThresholdResolutionEngine:
         2. Config overrides
         3. Regime overrides
         4. Family overrides
-        5. Adaptive Systems Data (Highest Priority)
+        5. Adaptive Systems Data (Highest Priority - Cached)
         """
-        # 1. Base Defaults (Pull from RegimeConfig if possible)
+        # 1. Base Defaults
         resolved = {
             "min_score": getattr(self.thresholds_config, 'min_score', 50),
             "min_relative_leadership": getattr(self.thresholds_config, 'min_relative_leadership', 0),
@@ -28,12 +42,6 @@ class ThresholdResolutionEngine:
             "time_stop_bars": getattr(self.thresholds_config, 'time_stop_bars', 24)
         }
         
-        # Pull from config if it exists
-        if hasattr(self.thresholds_config, "min_volume"):
-            resolved["min_volume"] = self.thresholds_config.min_volume
-        elif isinstance(self.thresholds_config, dict):
-            resolved["min_volume"] = self.thresholds_config.get("min_volume", resolved["min_volume"])
-            
         # 2. Regime Overrides
         if hasattr(self.thresholds_config, "overrides") and regime in self.thresholds_config.overrides:
             override = self.thresholds_config.overrides[regime]
@@ -62,17 +70,10 @@ class ThresholdResolutionEngine:
                     if val is not None:
                         resolved[key] = val
             
-        # 5. Adaptive System Overrides (Highest Priority)
-        if os.path.exists(self.adaptive_path):
-            try:
-                with open(self.adaptive_path, 'r') as f:
-                    data = yaml.safe_load(f)
-                    if isinstance(data, dict) and 'current_thresholds' in data:
-                        adapted = data['current_thresholds']
-                        for key in ["min_score", "min_volume"]:
-                            if key in adapted:
-                                resolved[key] = adapted[key]
-            except Exception as e:
-                logger.error(f"Failed to load adaptive thresholds: {e}")
+        # 5. Adaptive System Overrides (Highest Priority - Cached)
+        if self._adaptive_cache:
+            for key in ["min_score", "min_volume"]:
+                if key in self._adaptive_cache:
+                    resolved[key] = self._adaptive_cache[key]
                 
         return resolved

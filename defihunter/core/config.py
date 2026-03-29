@@ -115,6 +115,13 @@ class TrainingConfig(BaseModel):
         "colsample_bytree": 0.8
     })
 
+class ScoringConfig(BaseModel):
+    trend_weight: float = 0.5
+    expansion_weight: float = 0.5
+    participation_weight: float = 0.5
+    relative_leadership_weight: float = 2.0
+    funding_penalty_weight: float = 1.0
+
 class ExitConfig(BaseModel):
     enable_leadership_decay: bool = True
 
@@ -134,7 +141,9 @@ class AppConfig(BaseModel):
     labeling: LabelingConfig = Field(default_factory=LabelingConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     exit: ExitConfig = Field(default_factory=ExitConfig)
+
 
     def get_family_execution(self, family: str) -> FamilyExecutionConfig:
         """Return FamilyExecutionConfig for a family, defaulting to trade_allowed."""
