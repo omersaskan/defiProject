@@ -36,18 +36,30 @@ class BacktestEngine:
     # ─────────────────────────────────────────────────────────────────────────
     def _sanitize_simulation_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        GT #19: Future Leakage Firewall.
-        Removes any columns that contain future information to ensure
-        the simulation reflects true live-trade conditions.
+        GT #19: Future Leakage Firewall and Entry Sanitization.
         """
+        # Strict Entry Vectorization to prevent NaN truthiness
+        if 'entry_signal' in df.columns:
+            df['entry_signal'] = df['entry_signal'].fillna(False).astype(bool)
+        else:
+            df['entry_signal'] = False
+            
+        # Safe Family Defaults
+        if 'family' not in df.columns:
+            df['family'] = 'defi_beta'
+        else:
+            df['family'] = df['family'].fillna('defi_beta')
+            
+        # Force strict numerics for gating mechanisms
+        for col in ['entry_readiness', 'leader_prob', 'fakeout_risk', 'close', 'total_score', 'composite_leader_score']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
         leaky_patterns = ['future_', 'next_', 'target_', 'outcome', 'pnl_r', 'exit_']
-        # We keep 'ml_rank_score' and 'entry_signal' because they are 
-        # computed on historical data PER bar before simulation.
         to_drop = [c for c in df.columns if any(p in c for p in leaky_patterns) 
                   and c not in ['ml_rank_score', 'entry_signal', 'entry_readiness']]
         
         if to_drop:
-            # logger.info(f"[Sanitizer] Dropping leaky columns: {to_drop}")
             return df.drop(columns=to_drop)
         return df
 
@@ -73,19 +85,16 @@ class BacktestEngine:
         # Risk & Logic Engines
         from defihunter.engines.risk import RiskEngine
         
-        # We use a dummy fetcher for backtest to avoid network in correlation engine
-        class DummyFetcher:
-            def __init__(self): self.exchange = None
-        
-        risk_engine = RiskEngine(config=self.config.risk.dict() if hasattr(self.config, 'risk') else {}, fetcher=DummyFetcher())
+        # No Live Fetching during Backtest
+        risk_engine = RiskEngine(config=self.config.risk.dict() if hasattr(self.config, 'risk') else {}, fetcher=None)
 
-        # Portfolio State
         open_positions: List[Dict] = []
         self.trade_log = []
-        current_equity = 10000.0 # Nominal equity for risk sizing
-        daily_pnl_r = 0.0
-        last_date = None
-
+        self.execution_details = [] # Audit trail for gating decisions
+        
+        # O(1) correlation data grouping to prevent O(N) backward slicing during candidate evaluation
+        symbol_groups = {symbol: group for symbol, group in clean_df.groupby('symbol')}
+        
         # Config resolution
         bt_cfg        = getattr(self.config, 'backtest', None)
         fee_bps       = getattr(bt_cfg, 'fee_bps', 2.0)
@@ -93,6 +102,12 @@ class BacktestEngine:
         max_pos       = getattr(bt_cfg, 'max_concurrent_positions', 5)
         time_stop     = getattr(bt_cfg, 'time_stop_bars', 24)
         total_costs   = (fee_bps + slippage_bps) / 10_000.0
+
+        # Standardized initial equity explicitly from Backtest config 
+        initial_equity = float(getattr(bt_cfg, 'initial_equity', 10000.0) if bt_cfg else 10000.0)
+        current_equity = initial_equity
+        daily_pnl_r = 0.0
+        last_date = None
 
         for ts in timestamps:
             ts_lookup = fast_lookup.get(ts, {})
@@ -200,7 +215,8 @@ class BacktestEngine:
             open_positions = still_open
 
             # ── 2. New entries ────────────────────────────────────────────────
-            candidates = [row for s, row in ts_lookup.items() if row.get('entry_signal', False)]
+            # Safe boolean resolution for sanitized dataframe entries
+            candidates = [row for s, row in ts_lookup.items() if bool(row.get('entry_signal', False))]
 
             if candidates and len(open_positions) < max_pos:
                 rooms      = max_pos - len(open_positions)
@@ -213,6 +229,7 @@ class BacktestEngine:
                 top_cands = candidates[:rooms]
 
                 for c in top_cands:
+                    # Explicit re-entry check: skip if currently holding
                     if any(p['symbol'] == c['symbol'] for p in open_positions):
                         continue
 
@@ -221,21 +238,69 @@ class BacktestEngine:
                     regime   = str(c.get('historical_regime', 'trend'))
                     fakeout  = float(c.get('fakeout_risk', 0.0))
                     leader_p = float(c.get('leader_prob', 0.5))
+                    entry_readiness = float(c.get('entry_readiness', 0.0))
+
+                    # ── FAMILY EXECUTION CONFIG & GATING ─────────────────────
+                    exec_cfg = self.config.get_family_execution(family) if hasattr(self.config, 'get_family_execution') else None
+                    
+                    # 1. Participation Mode Gating
+                    # watch_only families allow ranking (ranking quality evaluation) 
+                    # but skip trade execution in this simulation loop.
+                    mode = getattr(exec_cfg, 'mode', 'trade_allowed') if exec_cfg else 'trade_allowed'
+                    if mode == 'watch_only':
+                        self.execution_details.append({"symbol": c['symbol'], "timestamp": ts, "decision": "skip", "reason": "watch_only_gate"})
+                        continue
+
+                    # 2. Metric Gating
+                    if exec_cfg:
+                        if entry_readiness < getattr(exec_cfg, 'min_entry_readiness', 0.0):
+                            self.execution_details.append({"symbol": c['symbol'], "timestamp": ts, "decision": "skip", "reason": "low_readiness"})
+                            continue
+                        if leader_p < getattr(exec_cfg, 'min_leader_prob', 0.0):
+                            self.execution_details.append({"symbol": c['symbol'], "timestamp": ts, "decision": "skip", "reason": "low_leader_prob"})
+                            continue
 
                     # ── RISK PARITY CHECK ─────────────────────────────────────
-                    # 1. Kelly Sizing
-                    kelly_risk_pct = risk_engine.calculate_kelly_size(
+                    # 1. Kelly Sizing + Family Mult
+                    base_kelly = risk_engine.calculate_kelly_size(
                         win_prob=leader_p, reward_risk=2.0, leader_prob=leader_p
                     )
+                    risk_pct_mult = getattr(exec_cfg, 'risk_pct_mult', 1.0) if exec_cfg else 1.0
+                    final_risk_pct = min(base_kelly * risk_pct_mult, risk_engine.max_risk_per_trade_pct)
                     
                     # 2. Daily Loss Killswitch (approximation in R)
-                    # risk_engine expects % loss. We use daily_pnl_r * risk_per_trade_pct
                     risk_per_trade = (getattr(self.config.risk, 'max_risk_per_trade_pct', 1.0) 
                                      if hasattr(self.config, 'risk') else 1.0)
                     estimated_daily_loss_pct = daily_pnl_r * risk_per_trade
                     
-                    # 3. Validation
-                    # In backtest we skip correlation (fetcher=None bypass)
+                    # 3. Stop Distance & Notional Estimation
+                    stop_width_mult = getattr(exec_cfg, 'stop_width_mult', 1.0) if exec_cfg else 1.0
+                    
+                    if c.get('stop_price', 0.0) and float(c.get('stop_price', 0.0)) > 0:
+                        stop_p = float(c['stop_price'])
+                    else:
+                        stop_result = self._adaptive_stop.compute_stop(
+                            c, family=family, regime=regime, fakeout_risk=fakeout,
+                            stop_width_mult=stop_width_mult
+                        )
+                        stop_p = stop_result['stop_price']
+                    
+                    # Notional used for margin/cap validation
+                    notional_est = risk_engine.estimate_notional_from_stop(
+                        equity_val=current_equity, risk_pct=final_risk_pct,
+                        entry_price=entry_p, stop_price=stop_p
+                    )
+
+                    # 4. Validation (with Family Position Cap Override)
+                    # GT-HARDENING: Deterministic In-Memory Correlation Path (No Monkey Patching)
+                    symbol_data_map_history = {}
+                    active_syms = [c['symbol']] + [p['symbol'] for p in open_positions]
+                    for s in active_syms:
+                        if s in symbol_groups:
+                            s_df = symbol_groups[s]
+                            symbol_data_map_history[s] = s_df[s_df['timestamp'] <= ts].tail(500)
+
+                    family_max_pos = getattr(exec_cfg, 'max_open_positions', None) if exec_cfg else None
                     is_valid, reason = risk_engine.validate_trade(
                         symbol=c['symbol'],
                         family=family,
@@ -243,22 +308,25 @@ class BacktestEngine:
                         equity_val=current_equity,
                         daily_loss_pct=estimated_daily_loss_pct,
                         leader_prob=leader_p,
-                        new_trade_notional=1000.0, # dummy notional for backtest validation
-                        leverage=getattr(self.config.risk, 'default_leverage', 5.0) if hasattr(self.config, 'risk') else 5.0
+                        new_trade_notional=notional_est,
+                        leverage=getattr(self.config.risk, 'default_leverage', 5.0) if hasattr(self.config, 'risk') else 5.0,
+                        family_max_pos=family_max_pos,
+                        symbol_data_map=symbol_data_map_history
                     )
                     
                     if not is_valid:
+                        self.execution_details.append({"symbol": c['symbol'], "timestamp": ts, "decision": "skip", "reason": f"risk_engine_veto: {reason}"})
                         continue
 
-                    # Adaptive stop/TP
+                    self.execution_details.append({"symbol": c['symbol'], "timestamp": ts, "decision": "execute", "reason": "passed_all_gates"})
+
+                    # Adaptive stop/TP selection
                     if c.get('stop_price', 0.0) and float(c.get('stop_price', 0.0)) > 0:
-                        stop_p  = float(c['stop_price'])
-                        tp1_p   = float(c.get('tp1_price', entry_p * 1.05))
-                        tp2_p   = float(c.get('tp2_price', entry_p * 1.10))
+                        stop_p = float(c['stop_price'])
+                        tp1_p  = float(c.get('tp1_price', entry_p * 1.05))
+                        tp2_p  = float(c.get('tp2_price', entry_p * 1.10))
                     else:
-                        stop_result = self._adaptive_stop.compute_stop(
-                            c, family=family, regime=regime, fakeout_risk=fakeout
-                        )
+                        # Re-calculate with stop_width_mult (stop_result was computed above)
                         stop_p = stop_result['stop_price']
                         tp1_p  = stop_result['tp1_price']
                         tp2_p  = stop_result['tp2_price']
@@ -280,26 +348,29 @@ class BacktestEngine:
                         "highest_seen":  entry_p,
                         "status":        "open",   # open | runner
                         "partial_taken": False,
-                        "kelly_risk":    kelly_risk_pct,
+                        "kelly_risk":    final_risk_pct,
                     })
 
-        # ── Metrics compilation ───────────────────────────────────────────────
+        # Metrics compilation
         if not self.trade_log:
-            return {"win_rate": 0, "profit_factor": 0, "expectancy_r": 0,
-                    "total_trades": 0, "avg_bars_held": 0}
+            return {
+                "win_rate": 0, "profit_factor": 0, "expectancy_r": 0,
+                "total_trades": 0, "avg_bars_held": 0, "hold_efficiency": 0,
+                "execution_details": self.execution_details
+            }
 
-        t_df     = pd.DataFrame(self.trade_log)
-        wins     = t_df[t_df['pnl_r'] > 0]
-        losses   = t_df[t_df['pnl_r'] < 0]
+        t_df = pd.DataFrame(self.trade_log)
+        wins = t_df[t_df['pnl_r'] > 0]
+        losses = t_df[t_df['pnl_r'] < 0]
         win_rate = len(wins) / len(t_df) if len(t_df) > 0 else 0
         expectancy = t_df['pnl_r'].mean()
+        
+        pos_pnl = wins['pnl_r'].sum()
+        neg_pnl = abs(losses['pnl_r'].sum())
+        pf = pos_pnl / neg_pnl if neg_pnl > 0 else (99.0 if pos_pnl > 0 else 0)
 
-        pos_pnl  = wins['pnl_r'].sum()
-        neg_pnl  = abs(losses['pnl_r'].sum())
-        pf       = pos_pnl / neg_pnl if neg_pnl > 0 else (99.0 if pos_pnl > 0 else 0)
-
-        # Hold / exit efficiency
-        mfe_col  = 'mfe_r' if 'mfe_r' in t_df.columns else 'peak_pnl_r'
+        # Efficiency metrics
+        mfe_col = 'mfe_r' if 'mfe_r' in t_df.columns else 'peak_pnl_r'
         hold_eff = 0.0
         if not wins.empty and mfe_col in wins.columns:
             peaks = wins[mfe_col]
@@ -309,13 +380,13 @@ class BacktestEngine:
                 hold_eff = round((realized[valid.index].mean() / valid.mean()) * 100, 1)
 
         return {
-            "win_rate":      round(win_rate * 100, 2),
-            "expectancy_r":  round(expectancy, 3),
+            "win_rate": round(win_rate * 100, 2),
+            "expectancy_r": round(expectancy, 3),
             "profit_factor": round(pf, 2),
-            "total_trades":  len(t_df),
+            "total_trades": len(t_df),
             "avg_bars_held": round(t_df['bars_held'].mean(), 1),
-            "partial_tp_count": int(t_df['partial_taken'].sum()),
-            "hold_efficiency":  hold_eff,
+            "hold_efficiency": hold_eff,
+            "execution_details": self.execution_details # Return the audit trail
         }
 
     # ─────────────────────────────────────────────────────────────────────────

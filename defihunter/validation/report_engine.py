@@ -87,8 +87,7 @@ class ReportEngine:
             "total_candidates":        len(df),
             "paper_trades_opened":     len(trades),
             "leader_capture_rate":     round(df["leader_captured"].mean() * 100, 1),
-            "top_k_precision":         round(np.nanmean(per_scan_prec) * 100, 1) if per_scan_prec else None,
-            "top_k_recall":            round(np.nanmean(per_scan_prec) * 100, 1) if per_scan_prec else None,
+            "top_k_hit_rate":          round(np.nanmean(per_scan_prec) * 100, 1) if per_scan_prec else None,
             "rank_correlation":        round(np.nanmean(per_scan_corr), 3) if per_scan_corr else None,
             "avg_future_family_rank":  round(df["future_24h_rank_in_family"].mean(), 2),
             "profit_factor":           round(pos_p / neg_p, 2) if neg_p else None,
@@ -229,7 +228,10 @@ class ReportEngine:
             if not sel_ranks.empty:
                 family_ranks.append(sel_ranks.mean())
 
-        sel  = df[df["paper_trade_opened"] == True].copy() if "paper_trade_opened" in df.columns and score_col == "composite_leader_score" else df.groupby("scan_id").apply(lambda g: g.nlargest(self.k, score_col)).reset_index(drop=True)
+        if "paper_trade_opened" in df.columns and score_col == "composite_leader_score":
+            sel = df[df["paper_trade_opened"] == True].copy()
+        else:
+            sel = df.sort_values(score_col, ascending=False).groupby("scan_id").head(self.k).copy()
         wins = sel[sel.get("pnl_r", pd.Series()) > 0] if "pnl_r" in sel.columns else pd.DataFrame()
         lss  = sel[sel.get("pnl_r", pd.Series()) <= 0] if "pnl_r" in sel.columns else pd.DataFrame()
         pos_p= wins["pnl_r"].sum() if not wins.empty else 0
@@ -237,7 +239,7 @@ class ReportEngine:
 
         return {
             "leader_capture_rate": round(np.nanmean(capture_rates) * 100, 1) if capture_rates else None,
-            "top_k_precision":     round(np.nanmean(per_scan_prec) * 100, 1) if per_scan_prec else None,
+            "top_k_hit_rate":      round(np.nanmean(per_scan_prec) * 100, 1) if per_scan_prec else None,
             "rank_correlation":    round(np.nanmean(per_scan_corr), 3) if per_scan_corr else None,
             "avg_future_rank":     round(np.nanmean(family_ranks), 2) if family_ranks else None,
             "profit_factor":       round(pos_p / neg_p, 2) if neg_p else None,

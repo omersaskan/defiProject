@@ -22,7 +22,7 @@ class ThresholdResolutionEngine:
             except Exception as e:
                 logger.error(f"Failed to load adaptive thresholds from {self.adaptive_path}: {e}")
 
-    def resolve_thresholds(self, regime: str, family: str) -> dict:
+    def resolve_thresholds(self, regime: str, family: str, volatility: str = "normal") -> dict:
         """
         Resolves thresholds based on precedence:
         1. Base thresholds
@@ -43,18 +43,40 @@ class ThresholdResolutionEngine:
         }
         
         # 2. Regime Overrides
-        if hasattr(self.thresholds_config, "overrides") and regime in self.thresholds_config.overrides:
-            override = self.thresholds_config.overrides[regime]
-            for key in ["min_score", "min_relative_leadership", "min_volume", "max_spread_bps"]:
-                val = getattr(override, key, None)
-                if val is not None:
-                    resolved[key] = val
+        lookup_regime = regime
+        
+        # Determine the override dictionary
+        if hasattr(self.thresholds_config, "overrides"):
+            overrides_dict = self.thresholds_config.overrides
         elif isinstance(self.thresholds_config, dict) and "overrides" in self.thresholds_config:
-            override = self.thresholds_config["overrides"].get(regime, {})
-            for key, val in override.items():
-                if val is not None:
-                    resolved[key] = val
-                    
+            overrides_dict = self.thresholds_config["overrides"]
+        else:
+            overrides_dict = {}
+
+        # Fallback mapping: 'trend_btc_led', 'trend_alt_rotation' -> 'trend'
+        if lookup_regime not in overrides_dict and lookup_regime.startswith('trend_'):
+            lookup_regime = 'trend'
+
+        def apply_override(override_key: str):
+            if override_key in overrides_dict:
+                curr_override = overrides_dict[override_key]
+                if isinstance(curr_override, dict):
+                    for key, val in curr_override.items():
+                        if val is not None:
+                            resolved[key] = val
+                else:
+                    for key in ["min_score", "min_relative_leadership", "min_volume", "max_spread_bps"]:
+                        val = getattr(curr_override, key, None)
+                        if val is not None:
+                            resolved[key] = val
+                            
+        # Apply Base Regime Overrides
+        apply_override(lookup_regime)
+        
+        # Apply Volatility Overrides (stacks on top of regime if present e.g. 'high_vol')
+        if volatility and volatility != "normal":
+            apply_override(volatility)
+            
         # 4. Family Overrides (Config-Driven Patch 4)
         families_dict = {}
         if self.config and hasattr(self.config, 'families'):

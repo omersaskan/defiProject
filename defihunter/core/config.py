@@ -24,6 +24,7 @@ class FeatureConfig(BaseModel):
     retest_tolerance: float = 0.5
     
 class BacktestConfig(BaseModel):
+    initial_equity: float = 10000.0
     fee_bps: float = 2.0
     slippage_bps: float = 1.0
     max_concurrent_positions: int = 5
@@ -177,4 +178,16 @@ def load_config(path: str | Path) -> AppConfig:
             if 'universe_filters' in groups_data:
                 data['universe'] = {**data.get('universe', {}), **groups_data['universe_filters']}
 
-    return AppConfig(**data)
+    config = AppConfig(**data)
+    
+    # ── Sprint 1 Guard: Strict Family Overlap Validation ──
+    seen_members = {}
+    for family_name, family_cfg in config.families.items():
+        for member in family_cfg.members:
+            if member in seen_members:
+                error_msg = f"[CONFIG VALIDATION ERROR] Symbol '{member}' exists in multiple families: '{seen_members[member]}' and '{family_name}'. Symbols must explicitly belong to only one family."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            seen_members[member] = family_name
+
+    return config

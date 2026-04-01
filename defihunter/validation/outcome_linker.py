@@ -145,16 +145,25 @@ class OutcomeLinker:
         hold_eff      = np.nan
 
         if symbol in trade_map:
-            # Find closest entry_time match
+            # Find closest entry_time match within 1 hour radius
+            best_t = None
+            min_dist = float('inf')
             for t in trade_map[symbol]:
-                if r_dist and r_dist > 0:
-                    pnl_r      = float(t.get("pnl_r", np.nan))
-                    mfe_r      = float(t.get("mfe_r", np.nan))
-                    giveback_r = float(t.get("giveback_r", np.nan))
-                    exit_reason = str(t.get("exit_reason", ""))
-                    if not np.isnan(mfe_r) and mfe_r > 0 and not np.isnan(pnl_r):
-                        hold_eff = pnl_r / mfe_r
-                    break
+                t_trade_ts = pd.to_datetime(t.get("entry_time"), utc=True, format='ISO8601', errors='coerce')
+                if pd.isna(t_trade_ts): continue
+                
+                dist = abs((t_trade_ts - scan_ts).total_seconds())
+                if dist <= 3600 and dist < min_dist:
+                    min_dist = dist
+                    best_t = t
+                    
+            if best_t and r_dist and r_dist > 0:
+                pnl_r      = float(best_t.get("pnl_r", np.nan))
+                mfe_r      = float(best_t.get("mfe_r", np.nan))
+                giveback_r = float(best_t.get("giveback_r", np.nan))
+                exit_reason = str(best_t.get("exit_reason", ""))
+                if not np.isnan(mfe_r) and mfe_r > 0 and not np.isnan(pnl_r):
+                    hold_eff = pnl_r / mfe_r
         else:
             # Derive pnl_r from raw price if no trade log
             if r_dist and r_dist > 0:

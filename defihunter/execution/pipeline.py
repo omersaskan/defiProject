@@ -73,7 +73,8 @@ class SignalPipeline:
         sector_data: Optional[Dict[str, Any]] = None,
         adaptive_weights: Optional[Dict[str, float]] = None,
         scan_timestamp: Optional[datetime] = None,
-        mode: Literal["live", "historical", "shadow"] = "live"
+        mode: Literal["live", "historical", "shadow"] = "live",
+        volatility_label: Optional[str] = None
     ) -> PipelineResult:
         """
         Executes the canonical processing chain (Stage-based Processor Pattern).
@@ -82,8 +83,8 @@ class SignalPipeline:
         scan_timestamp = scan_timestamp or start_t
         
         # STAGE 1: Global Context
-        regime_label, sector_data, adaptive_weights = self._stage_context(
-            anchor_context, regime_label, sector_data, adaptive_weights
+        regime_label, sector_data, adaptive_weights, volat_label = self._stage_context(
+            anchor_context, regime_label, sector_data, adaptive_weights, volatility_label
         )
 
         # STAGE 2: Per-Symbol Feature Enrichment (Leadership, Profiles)
@@ -93,7 +94,7 @@ class SignalPipeline:
 
         # STAGE 3: Family Stats & Scoring (Aggregations, Rules, Thresholds)
         family_stats, all_last_rows = self._stage_scoring(
-            processed_data_map, symbol_context_map, regime_label, sector_data, adaptive_weights
+            processed_data_map, symbol_context_map, regime_label, sector_data, adaptive_weights, volat_label
         )
 
         if not all_last_rows:
@@ -119,15 +120,23 @@ class SignalPipeline:
         )
     # --- Processing Stages ---
 
-    def _stage_context(self, anchor_context, regime, sector, weights):
+    def _stage_context(self, anchor_context, regime, sector, weights, volatility=None):
         """Stage 1: Resolve global market and sector state."""
+        out_volatility = volatility or "normal"
+        
+        # Protective unpack in case upstream forgot to split the tuple
+        if isinstance(regime, tuple):
+            regime, out_volatility = regime
+
         if regime is None:
-            regime = self._resolve_regime(anchor_context)
+            regime, out_volatility = self._resolve_regime(anchor_context)
+            
         if sector is None:
             sector = self._resolve_sector_regime(anchor_context)
         if weights is None:
             weights = self._get_default_weights()
-        return regime, sector, weights
+            
+        return regime, sector, weights, out_volatility
 
     def _stage_symbol_features(self, symbol_data_map, anchor_context):
         """Stage 2: Per-symbol enrichment (Leadership, Family Profile)."""
@@ -152,7 +161,7 @@ class SignalPipeline:
             
         return symbol_context_map, processed_data_map
 
-    def _stage_scoring(self, processed_data_map, symbol_context_map, regime, sector, weights):
+    def _stage_scoring(self, processed_data_map, symbol_context_map, regime, sector, weights, volatility):
         """Stage 3: Cross-sectional aggregation and rule-based scoring."""
         family_stats = self.family_aggregator.compute_family_stats(processed_data_map, timeframe=self.timeframe)
         all_last_rows = []
@@ -161,7 +170,7 @@ class SignalPipeline:
             df = self.family_aggregator.inject_family_features(symbol, df, family_stats, timeframe=self.timeframe)
             
             ctx = symbol_context_map[symbol]
-            res_thresholds = self.threshold_engine.resolve_thresholds(regime=regime, family=ctx["family"])
+            res_thresholds = self.threshold_engine.resolve_thresholds(regime=regime, family=ctx["family"], volatility=volatility)
             ctx["resolved_thresholds"] = res_thresholds
             
             df = self.rule_engine.evaluate(
@@ -222,13 +231,13 @@ class SignalPipeline:
         except Exception as e:
             logger.warning(f"[Pipeline] DB Feature logging failed: {e}")
 
-    def _resolve_regime(self, anchor_context: Dict[str, Dict[str, pd.DataFrame]]) -> str:
+    def _resolve_regime(self, anchor_context: Dict[str, Dict[str, pd.DataFrame]]) -> Tuple[str, str]:
         btc_a = next((a for a in anchor_context if a.startswith("BTC")), None)
         eth_a = next((a for a in anchor_context if a.startswith("ETH")), None)
         if btc_a and eth_a:
             data = self.regime_engine.detect_regime(anchor_context[btc_a], anchor_context[eth_a])
-            return data.get("label", "unknown")
-        return "unknown"
+            return data.get("label", "unknown"), data.get("volatility", "normal")
+        return "unknown", "normal"
 
     def _resolve_sector_regime(self, anchor_context: Dict[str, Dict[str, pd.DataFrame]]) -> Dict[str, Any]:
         return self.sector_engine.get_sector_regime(

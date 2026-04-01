@@ -7,7 +7,7 @@ import asyncio
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 
 from defihunter.data.binance_fetcher import BinanceFuturesFetcher
@@ -97,7 +97,7 @@ class ScanPipeline:
             await self._prepare_anchors()
 
             # 2. Resolve Global Context
-            regime_label = self._resolve_regimes(force_regime)
+            regime_label, volat_label = self._resolve_regimes(force_regime)
             adaptive_weights = self._update_adaptive_weights(regime_label)
             sector_data = self._resolve_sector_regime()
 
@@ -115,7 +115,8 @@ class ScanPipeline:
                 regime_label=regime_label,
                 sector_data=sector_data,
                 adaptive_weights=adaptive_weights,
-                mode="live"
+                mode="live",
+                volatility_label=volat_label
             )
 
             # 5. EXECUTION & SIDE EFFECTS
@@ -155,7 +156,11 @@ class ScanPipeline:
             self.anchor_mtf[anchor] = {}
             for tf in ["15m", "1h", "4h"]:
                 tasks.append(self._fetch_and_prep_anchor(anchor, tf))
-        await asyncio.gather(*tasks)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning(f"[Scanner] Anchor fetch failed: {r}")
 
     async def _fetch_and_prep_anchor(self, anchor, tf):
         df = await self.fetcher.async_fetch_ohlcv(anchor, timeframe=tf, limit=150)
@@ -164,9 +169,9 @@ class ScanPipeline:
             self.anchor_mtf[anchor][tf] = df
 
 
-    def _resolve_regimes(self, force_regime: Optional[str]) -> str:
+    def _resolve_regimes(self, force_regime: Optional[str]) -> Tuple[str, str]:
         # Use SignalPipeline's helper but allow forced override
-        resolved = self.signal_core._resolve_regime(self.anchor_mtf)
+        resolved_label, resolved_vol = self.signal_core._resolve_regime(self.anchor_mtf)
         
         force_from_cfg = None
         if hasattr(self.config.regimes, "overrides") and isinstance(self.config.regimes.overrides, dict):
@@ -175,8 +180,8 @@ class ScanPipeline:
         final_regime = force_regime or force_from_cfg
         if final_regime and final_regime != "Otomatik İzin Ver":
             logger.info(f"[Regime] Overridden to {final_regime}")
-            return final_regime
-        return resolved
+            return final_regime, resolved_vol
+        return resolved_label, resolved_vol
 
     def _update_adaptive_weights(self, regime_label: str) -> dict:
         try:
@@ -227,8 +232,16 @@ class ScanPipeline:
         tasks = {symbol: self.fetcher.async_fetch_ohlcv(symbol, timeframe=self.timeframe, limit=200) 
                  for symbol in watch_list if not self._should_skip(symbol)}
         
-        results = await asyncio.gather(*tasks.values())
-        return {symbol: df for symbol, df in zip(tasks.keys(), results) if not df.empty and len(df) >= 55}
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        
+        valid_results = {}
+        for symbol, df in zip(tasks.keys(), results):
+            if isinstance(df, Exception):
+                logger.warning(f"[Scanner] Async fetch failed for {symbol}: {df}")
+                continue
+            if not df.empty and len(df) >= 55:
+                valid_results[symbol] = df
+        return valid_results
 
     async def _process_features_parallel(self, raw_dfs: Dict[str, pd.DataFrame]):
         """Runs build_feature_pipeline in parallel across multiple processes."""
@@ -295,16 +308,31 @@ class ScanPipeline:
     def _handle_trade_decision(self, d, regime, daily_loss, master_df):
         fam = d.explanation.get("family", "defi_beta")
         exec_cfg = self.config.get_family_execution(fam) if hasattr(self.config, "get_family_execution") else None
-        mode = getattr(exec_cfg, "mode", "trade_allowed") if exec_cfg else "trade_allowed"
         
+        # 1. Participation Mode Gating
+        mode = getattr(exec_cfg, "mode", "trade_allowed") if exec_cfg else "trade_allowed"
         if mode == "watch_only":
-            d.explanation["participation_mode"] = "watch_only"
+            d.decision, d.explanation["participation_mode"] = "watch", "watch_only"
             return
 
-        # Risk & Sizing
-        kelly = self.risk_engine.calculate_kelly_size(win_prob=d.leader_prob or 0.5, reward_risk=2.0, leader_prob=d.leader_prob)
+        # 2. Family Metric Gating (min_entry_readiness, min_leader_prob)
+        if exec_cfg:
+            if d.entry_readiness < exec_cfg.min_entry_readiness:
+                d.decision, d.explanation["rejection_reason"] = "reject", "family_min_readiness_not_met"
+                return
+            if d.leader_prob < exec_cfg.min_leader_prob:
+                d.decision, d.explanation["rejection_reason"] = "reject", "family_min_leader_prob_not_met"
+                return
+
+        # 3. Risk & Sizing (Post-Kelly Multiplier)
+        # GT-HARDENING: Core Kelly is pure; family-specific risk mult is applied afterward.
+        base_kelly = self.risk_engine.calculate_kelly_size(
+            win_prob=d.leader_prob or 0.5, reward_risk=2.0, leader_prob=d.leader_prob
+        )
+        risk_pct_mult = getattr(exec_cfg, "risk_pct_mult", 1.0) if exec_cfg else 1.0
+        final_risk_pct = min(base_kelly * risk_pct_mult, self.risk_engine.max_risk_per_trade_pct)
         
-        # Adaptive Stop
+        # 4. Adaptive Stop logic (handles stop_width_mult)
         sym_rows = master_df[master_df["symbol"] == d.symbol]
         atr = float(sym_rows["_atr"].iloc[-1]) if not sym_rows.empty else 0.0
         
@@ -313,24 +341,31 @@ class ScanPipeline:
             fakeout_risk=d.fakeout_risk, stop_width_mult=getattr(exec_cfg, "stop_width_mult", 1.0)
         )
         
+        # 5. Notional Estimation
         notional = self.risk_engine.estimate_notional_from_stop(
-            equity_val=self.paper_engine.portfolio.balance_usd, risk_pct=kelly,
+            equity_val=self.paper_engine.portfolio.balance_usd, risk_pct=final_risk_pct,
             entry_price=d.entry_price, stop_price=stop_result["stop_price"]
         )
+        
+        # 6. Risk Engine Validation (with Family Position Cap Override)
+        family_max_pos = getattr(exec_cfg, "max_open_positions", None) if exec_cfg else None
         
         is_val, reason = self.risk_engine.validate_trade(
             symbol=d.symbol, family=fam, current_portfolio=[p.dict() for p in self.paper_engine.portfolio.open_positions],
             equity_val=self.paper_engine.portfolio.balance_usd, daily_loss_pct=daily_loss,
-            leader_prob=d.leader_prob, new_trade_notional=notional
+            leader_prob=d.leader_prob, new_trade_notional=notional,
+            family_max_pos=family_max_pos,
+            symbol_data_map=self.symbol_data_map
         )
         
         if is_val:
-            self.paper_engine.open_position(d, risk_pct=kelly, adaptive_stop_result=stop_result)
+            self.paper_engine.open_position(d, risk_pct=final_risk_pct, adaptive_stop_result=stop_result)
             self.paper_opened.add(d.symbol)
-            self.kelly_map[d.symbol] = kelly
+            self.kelly_map[d.symbol] = final_risk_pct
             self.adaptive_stop_map[d.symbol] = stop_result
         else:
             d.decision, d.explanation["rejection_reason"] = "reject", reason
+
 
     def _finalize_scan(self, executed, regime, watch_size):
         self.shadow_logger.log_scan(
