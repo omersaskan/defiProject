@@ -8,8 +8,11 @@ import time
 from defihunter.utils.logger import logger
 
 class BinanceFuturesFetcher:
-    def __init__(self):
+    _history_cache = {} # Class-level cache to share across instances (e.g. scanner runs)
+
+    def __init__(self, cache_ttl: int = 600):
         # We use strict binanceusdm (USDT/USDC-m futures)
+        self.cache_ttl = cache_ttl
         self.exchange = ccxt.binanceusdm({
             'enableRateLimit': True,
             'options': {
@@ -21,9 +24,11 @@ class BinanceFuturesFetcher:
             'enableRateLimit': True
         })
         
-        # Async Exchanges
         self.a_exchange = None
         self.a_spot_exchange = None
+        
+        # GT-HARDENING: Explicit side-channel registry to survive dataframe mutation
+        self.degradation_registry = {}
 
     async def _get_a_exchange(self):
         if self.a_exchange is None:
@@ -96,6 +101,38 @@ class BinanceFuturesFetcher:
         base = symbol.upper().replace('.P', '').split('/')[0]
         return f"{base}/USDT:USDT"
 
+    async def async_fetch_historical_funding(self, symbol: str, days: int = 180) -> pd.DataFrame:
+        """Async version of fetch_historical_funding."""
+        api_symbol = self._format_to_api(symbol)
+        exchange = await self._get_a_exchange()
+        try:
+            start_ms = exchange.milliseconds() - (days * 24 * 60 * 60 * 1000)
+            records = []
+            since = start_ms
+            
+            while True:
+                batch = await exchange.fetch_funding_rate_history(
+                    api_symbol, since=since, limit=500
+                )
+                if not batch:
+                    break
+                for r in batch:
+                    records.append({
+                        'timestamp': pd.to_datetime(r['timestamp'], unit='ms'),
+                        'funding_rate': float(r.get('fundingRate', 0.0))
+                    })
+                since = batch[-1]['timestamp'] + 1
+                if len(batch) < 500:
+                    break
+                await asyncio.sleep(exchange.rateLimit / 1000)
+                
+            if not records:
+                return pd.DataFrame()
+            return pd.DataFrame(records).set_index('timestamp')
+        except Exception as e:
+            logger.warning(f"[AsyncFetcher] Could not fetch funding history for {symbol}: {e}")
+            return pd.DataFrame()
+
     def fetch_historical_funding(self, symbol: str, days: int = 180) -> pd.DataFrame:
         """
         GT #3 / BUG #2 FIX: Fetches historical funding rates from Binance.
@@ -130,6 +167,51 @@ class BinanceFuturesFetcher:
         except Exception as e:
             logger.warning(f"[Fetcher] Could not fetch funding history for {symbol}: {e}")
             return pd.DataFrame()
+
+    async def async_fetch_open_interest_history(self, symbol: str, period: str = '1h', days: int = 180) -> pd.DataFrame:
+        """Async version of fetch_open_interest_history."""
+        api_symbol = self._format_to_api(symbol).replace('/USDT:USDT', 'USDT')
+        exchange = await self._get_a_exchange()
+        records = []
+        try:
+            start_ms = exchange.milliseconds() - (days * 24 * 60 * 60 * 1000)
+            since = start_ms
+            
+            while True:
+                try:
+                    batch = await exchange.fetch_open_interest_history(
+                        api_symbol.replace('USDT', '/USDT:USDT'),
+                        timeframe=period,
+                        since=int(since),
+                        limit=500
+                    )
+                except Exception:
+                    break
+                    
+                if not batch:
+                    break
+                for r in batch:
+                    ts = r.get('timestamp') or r.get('openInterestTimestamp')
+                    oi = r.get('openInterestValue') or r.get('openInterestAmount') or 0.0
+                    if ts:
+                        records.append({
+                            'timestamp': pd.to_datetime(ts, unit='ms') if isinstance(ts, (int, float)) else pd.to_datetime(ts),
+                            'open_interest': float(oi)
+                        })
+                if len(batch) < 500:
+                    break
+                last_ts = batch[-1].get('timestamp') or batch[-1].get('openInterestTimestamp')
+                if last_ts:
+                    since = int(last_ts) + 1
+                else:
+                    break
+                await asyncio.sleep(exchange.rateLimit / 1000)
+        except Exception as e:
+            logger.warning(f"[AsyncFetcher] OI history not available for {symbol}: {e}")
+            return pd.DataFrame()
+        
+        if not records: return pd.DataFrame()
+        return pd.DataFrame(records).drop_duplicates('timestamp').set_index('timestamp').sort_index()
 
     def fetch_open_interest_history(self, symbol: str, period: str = '1h', days: int = 180) -> pd.DataFrame:
         """
@@ -346,8 +428,12 @@ class BinanceFuturesFetcher:
             logger.error(f"Error fetching OHLCV for {symbol}: {e}")
             return pd.DataFrame()
 
-    async def async_fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 500) -> pd.DataFrame:
-        """Async version of fetch_ohlcv."""
+    async def async_fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 500, days: int = 3) -> pd.DataFrame:
+        """
+        Asynchronously fetch OHLCV and merge with cached/fetched OI & Funding.
+        GT-HARDENING: Uses pd.merge_asof for robust alignment and TTL cache for efficiency.
+        REGRESSION-FIX: Restored full column names and taker volume derivation.
+        """
         try:
             api_symbol = self._format_to_api(symbol)
             exchange = await self._get_a_exchange()
@@ -355,26 +441,76 @@ class BinanceFuturesFetcher:
             ohlcv = await exchange.fetch_ohlcv(api_symbol, timeframe, limit=limit)
             if not ohlcv: return pd.DataFrame()
             
+            # Restore standard column names to prevent pipeline regression
             if len(ohlcv[0]) >= 12:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
+                # Essential taker volume derivation for compute_participation_features
                 df['taker_buy_volume'] = df['taker_buy_base'].astype(float)
                 df['taker_sell_volume'] = df['volume'].astype(float) - df['taker_buy_base'].astype(float)
             else:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df['quote_volume'] = df['volume'] * df['close']
+            df['quote_volume'] = df['volume'].astype(float) * df['close'].astype(float)
             
-            # Async Funding & OI (Simplified for now, or we can make them async too)
-            # For Phase 3, we want at least basic OHLCV to be async for the parallel scanner
-            df['funding_rate'] = 0.0
-            df['open_interest'] = 0.0
+            # --- CACHED DATA FETCHING ---
+            now = time.time()
+            funding_history = pd.DataFrame()
+            oi_history = pd.DataFrame()
+            
+            # 1. Funding History
+            f_cache_key = f"{symbol}_funding"
+            f_cache = self._history_cache.get(f_cache_key)
+            if f_cache and (now - f_cache['time'] < self.cache_ttl):
+                funding_history = f_cache['data']
+            else:
+                funding_history = await self.async_fetch_historical_funding(symbol, days=days)
+                if not funding_history.empty:
+                    self._history_cache[f_cache_key] = {'data': funding_history, 'time': now}
+
+            # 2. OI History
+            o_cache_key = f"{symbol}_{timeframe}_oi"
+            o_cache = self._history_cache.get(o_cache_key)
+            if o_cache and (now - o_cache['time'] < self.cache_ttl):
+                oi_history = o_cache['data']
+            else:
+                oi_history = await self.async_fetch_open_interest_history(symbol, period=timeframe, days=days)
+                if not oi_history.empty:
+                    self._history_cache[o_cache_key] = {'data': oi_history, 'time': now}
+
+            # --- ROBUST MERGE (merge_asof) ---
+            df = df.sort_values('timestamp')
+            
+            if symbol not in self.degradation_registry:
+                self.degradation_registry[symbol] = {'funding': False, 'oi': False}
+                
+            # Merge Funding
+            if not funding_history.empty:
+                f_h = funding_history.sort_index().reset_index()
+                df = pd.merge_asof(df, f_h, on='timestamp', direction='backward')
+                df['funding_rate'] = df['funding_rate'].ffill().bfill().fillna(0.0)
+            else:
+                df['funding_rate'] = 0.0
+                self.degradation_registry[symbol]['funding'] = True
+                df.attrs['degraded_funding'] = True
+
+            # Merge OI
+            if not oi_history.empty:
+                o_h = oi_history.sort_index().reset_index()
+                df = pd.merge_asof(df, o_h, on='timestamp', direction='backward')
+                df['open_interest'] = df['open_interest'].ffill().bfill().fillna(0.0)
+            else:
+                df['open_interest'] = 0.0
+                self.degradation_registry[symbol]['oi'] = True
+                df.attrs['degraded_oi'] = True
+                
             df['spread_bps'] = 5.0
             return df
         except Exception as e:
             logger.error(f"[AsyncFetcher] Error for {symbol}: {e}")
             return pd.DataFrame()
 
+    def fetch_spot_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 500) -> pd.DataFrame:
         """
         GT-PRO #1: Fetches Spot OHLCV for a coin to compare with Futures.
         """

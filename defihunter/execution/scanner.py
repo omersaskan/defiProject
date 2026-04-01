@@ -92,21 +92,48 @@ class ScanPipeline:
         start_t = time.time()
         load_false_signal_memory()
 
+        # Stage Timings
+        self.timings = {}
+
         try:
             # 1. MTF Context for Anchors (Async)
+            t0 = time.time()
             await self._prepare_anchors()
+            self.timings["1_prepare_anchors_ms"] = (time.time() - t0) * 1000
 
             # 2. Resolve Global Context
             regime_label, volat_label = self._resolve_regimes(force_regime)
             adaptive_weights = self._update_adaptive_weights(regime_label)
             sector_data = self._resolve_sector_regime()
 
-            # 3. Build Watchlist & Async Fetch RAW
-            watch_list = self._build_watchlist(limit)
+            # 3. Build Watchlist
+            t0 = time.time()
+            watch_list = await self._build_watchlist(limit)
+            self.timings["2_build_watchlist_ms"] = (time.time() - t0) * 1000
+            
+            # 3b. Async Fetch RAW
+            t0 = time.time()
             raw_dfs = await self._fetch_raw_only_async(watch_list)
+            self.timings["3_fetch_raw_async_ms"] = (time.time() - t0) * 1000
+            
+            # Extract Degraded Parity Telemetry via safe side-channel
+            self.degraded_funding_count = 0
+            self.degraded_oi_count = 0
+            if hasattr(self.fetcher, 'degradation_registry'):
+                for sym, status in self.fetcher.degradation_registry.items():
+                    if status.get('funding', False): self.degraded_funding_count += 1
+                    if status.get('oi', False): self.degraded_oi_count += 1
+            else:
+                for sym, df in raw_dfs.items():
+                    if getattr(df, "attrs", {}).get("degraded_funding", False):
+                        self.degraded_funding_count += 1
+                    if getattr(df, "attrs", {}).get("degraded_oi", False):
+                        self.degraded_oi_count += 1
             
             # 4. PARALLEL FEATURE ENGINEERING
+            t0 = time.time()
             await self._process_features_parallel(raw_dfs)
+            self.timings["4_process_features_ms"] = (time.time() - t0) * 1000
 
             # 5. EXECUTE SIGNAL CORE (Unified Pipeline)
             pipeline_result = self.signal_core.run(
@@ -118,27 +145,40 @@ class ScanPipeline:
                 mode="live",
                 volatility_label=volat_label
             )
+            
+            # Incorporate SignalCore timings into scanner array
+            if "timings" in pipeline_result.metadata:
+                self.timings.update(pipeline_result.metadata["timings"])
 
-            # 5. EXECUTION & SIDE EFFECTS
+            # 6. EXECUTION & SIDE EFFECTS
+            t0 = time.time()
             self._evaluate_exits_parallel()
             executed_decisions = self._execute_decisions(pipeline_result)
+            self.timings["s_scanner_exec_ms"] = (time.time() - t0) * 1000
 
             elapsed = time.time() - start_t
-            logger.info(f"Scan completed in {elapsed:.1f}s. Portfolio: ${self.paper_engine.portfolio.balance_usd:.2f}")
             
-            # 6. PERSISTENCE & MONITORING
+            # Logging Telemetry
+            logger.info(f"Scan completed in {elapsed:.1f}s. Universe: {len(self.symbol_data_map)} Portfolio: ${self.paper_engine.portfolio.balance_usd:.2f}")
+            logger.info(f"[Telemetry] Timings: { {k: f'{v:.1f}ms' for k,v in self.timings.items()} }")
+            if self.degraded_funding_count or self.degraded_oi_count:
+                logger.warning(f"[Telemetry] Degraded Parity - Funding: {self.degraded_funding_count} | OI: {self.degraded_oi_count}")
+            
+            # 7. PERSISTENCE & MONITORING
             try:
                 db_manager.log_scan(
                     timestamp=datetime.now(),
                     regime=regime_label,
                     universe_size=len(self.symbol_data_map),
                     duration_ms=elapsed * 1000,
-                    balance=self.paper_engine.portfolio.balance_usd
+                    balance=self.paper_engine.portfolio.balance_usd,
+                    degraded_funding=self.degraded_funding_count,
+                    degraded_oi=self.degraded_oi_count
                 )
                 monitor.report_scan(
                     duration_ms=elapsed * 1000,
                     universe_size=len(self.symbol_data_map),
-                    fallbacks=0 # We'll need to bubble this up from ml_engine later
+                    fallbacks=(self.degraded_funding_count + self.degraded_oi_count)
                 )
             except Exception as e:
                 logger.warning(f"[Scanner] DB/Monitor logging failed: {e}")
@@ -201,13 +241,13 @@ class ScanPipeline:
     def _resolve_sector_regime(self) -> dict:
         return self.signal_core._resolve_sector_regime(self.anchor_mtf)
 
-    def _build_watchlist(self, limit: int) -> list:
+    async def _build_watchlist(self, limit: int) -> list:
         from defihunter.data.universe import rank_by_relative_volume, build_anomaly_watchlist
         universe = self.fetcher.get_defi_universe(config=self.config)
         top_movers = self._get_top_movers(top_n=30)
         u_lim = universe[:200]
-        rvr_top = rank_by_relative_volume(u_lim, self.fetcher, timeframe="1h", lookback_bars=170, top_n=30)
-        anomaly_q = build_anomaly_watchlist(rvr_top + top_movers + self.config.anchors, self.fetcher)
+        rvr_top = await rank_by_relative_volume(u_lim, self.fetcher, timeframe="1h", lookback_bars=170, top_n=30)
+        anomaly_q = await build_anomaly_watchlist(rvr_top + top_movers + self.config.anchors, self.fetcher)
         full_list = list(dict.fromkeys(anomaly_q + [s for s in u_lim if s not in anomaly_q]))
         return full_list if not limit else full_list[:limit]
 

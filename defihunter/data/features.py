@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from defihunter.utils.timeframe import TimeframeHelper
 
-def compute_ohlcv_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_ohlcv_features(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     Computes basic OHLCV structural features and anomalies.
     """
@@ -29,9 +29,9 @@ def compute_ohlcv_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataF
     new_cols['max_recent_wick'] = wick_series.rolling(lookback, min_periods=1).max()
     new_cols['bar_count'] = np.arange(len(df)) + 1
     
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_atr_and_emas(df: pd.DataFrame, timeframe: str = '15m', atr_period=14, ema_periods=[20, 55, 100]) -> pd.DataFrame:
+def compute_atr_and_emas(df: pd.DataFrame, timeframe: str = '15m', atr_period=14, ema_periods=[20, 55, 100]) -> dict:
     """
     Computes Average True Range (ATR) and multiple EMAs.
     """
@@ -54,9 +54,9 @@ def compute_atr_and_emas(df: pd.DataFrame, timeframe: str = '15m', atr_period=14
     diff_bars = TimeframeHelper.get_bars('1h', timeframe)
     new_cols['volatility_velocity'] = new_cols['atr'].diff(diff_bars) / (new_cols['atr'].shift(diff_bars) + 1e-8)
         
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_zscores(df: pd.DataFrame, timeframe: str = '15m', window_duration='12h') -> pd.DataFrame:
+def compute_zscores(df: pd.DataFrame, timeframe: str = '15m', window_duration='12h') -> dict:
     """
     Computes rolling Z-scores for volume and quote_volume.
     """
@@ -69,9 +69,9 @@ def compute_zscores(df: pd.DataFrame, timeframe: str = '15m', window_duration='1
             rolling_std = df[col].rolling(window=window).std().shift(1) + 1e-8
             new_cols[f'{col}_zscore'] = (df[col] - rolling_mean) / rolling_std
             
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_returns(df: pd.DataFrame, timeframe: str = '15m', horizons=['1h', '4h', '12h', '24h']) -> pd.DataFrame:
+def compute_returns(df: pd.DataFrame, timeframe: str = '15m', horizons=['1h', '4h', '12h', '24h']) -> dict:
     """
     Computes percentage returns over strict backward horizons.
     GT-REDESIGN: Now uses TimeframeHelper to ensure horizons match time, not bars.
@@ -80,10 +80,10 @@ def compute_returns(df: pd.DataFrame, timeframe: str = '15m', horizons=['1h', '4
     for h_str in horizons:
         h_bars = TimeframeHelper.get_bars(h_str, timeframe)
         new_cols[f'return_{h_str}'] = (df['close'] / df['close'].shift(h_bars)) - 1
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
 
-def compute_time_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_time_features(df: pd.DataFrame) -> dict:
     """
     GT #10: Time-aware features — DeFi pumps cluster around Asia open and US open.
     Cyclical encoding prevents the model from treating hour 23 as far from hour 0.
@@ -104,9 +104,9 @@ def compute_time_features(df: pd.DataFrame) -> pd.DataFrame:
         for col in ['hour_sin', 'hour_cos', 'day_sin', 'day_cos',
                     'is_asia_session', 'is_us_open_session', 'is_weekend']:
             new_cols[col] = 0.0
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_participation_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_participation_features(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     Computes advanced participation metrics like volume MAs, CVD, OI deltas, and funding features.
     GT #12: Adds taker_surge — sudden market buy order explosion (pre-pump footprint).
@@ -215,9 +215,9 @@ def compute_participation_features(df: pd.DataFrame, timeframe: str = '15m') -> 
         # Low value = Heavy volume but price not moving (Absorption)
         new_cols['volume_efficiency'] = df['close'].pct_change(1).abs() / (df['quote_volume_zscore'].abs() + 0.1)
         
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_pre_pump_profile(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_pre_pump_profile(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     Golden Trick #1: Computes pre-pump accumulation fingerprints.
     Key insight: Before a pump, price moves sideways while volume gradually increases.
@@ -252,9 +252,9 @@ def compute_pre_pump_profile(df: pd.DataFrame, timeframe: str = '15m') -> pd.Dat
     else:
         new_cols['volume_spike_now'] = False
         
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_squeeze_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_squeeze_features(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     GT #13: Bollinger Band Squeeze + Keltner Channel.
     When BB is inside KC, volatility is compressed (squeeze state).
@@ -296,9 +296,9 @@ def compute_squeeze_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.Dat
         new_cols['squeeze_duration'] = 0
         new_cols['bb_width_pct'] = 0.5
     
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_breakout_features(df: pd.DataFrame, timeframe: str = '15m', lookback_h=5, atr_threshold=0.5) -> pd.DataFrame:
+def compute_breakout_features(df: pd.DataFrame, timeframe: str = '15m', lookback_h=5, atr_threshold=0.5) -> dict:
     """
     Computes breakout levels, distances, retest features, and sweep logic.
     BUG #1 FIX: All tightness/threshold calculations now use .shift(1) to prevent lookahead.
@@ -379,9 +379,9 @@ def compute_breakout_features(df: pd.DataFrame, timeframe: str = '15m', lookback
     else:
         new_cols['silent_accumulation'] = False
         
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_persistence_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_persistence_features(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     Computes quality of trend and exhaustion risk.
     """
@@ -422,9 +422,9 @@ def compute_persistence_features(df: pd.DataFrame, timeframe: str = '15m') -> pd
     else:
         new_cols['volume_persistence_score'] = 0
  
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_exit_decay_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_exit_decay_features(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     Computes features specifically useful for detecting trend death and leadership decay.
     """
@@ -444,7 +444,7 @@ def compute_exit_decay_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.
     else:
         new_cols['wick_exhaustion_flag'] = False
         
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
 def compute_family_features(df_merged: pd.DataFrame) -> pd.DataFrame:
     """
@@ -480,38 +480,50 @@ def compute_family_features(df_merged: pd.DataFrame) -> pd.DataFrame:
 def build_feature_pipeline(raw_data: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
     """
     Main pipeline joining all feature engineers per timestamp per symbol.
-    GT-REDESIGN: Propagates timeframe to all sub-components.
-    Optimized: Minimal intermediate copies.
+    GT-REDESIGN: Now uses staged dictionary batching to prevent Pandas fragmentation.
     """
     if raw_data.empty or 'timestamp' not in raw_data.columns:
         return raw_data
  
     df = raw_data.sort_values('timestamp').reset_index(drop=True)
  
-    df = compute_ohlcv_features(df, timeframe)
-    df = compute_atr_and_emas(df, timeframe)
-    df = compute_zscores(df, timeframe)
-    df = compute_returns(df, timeframe)
-    df = compute_time_features(df)
-    df = compute_participation_features(df, timeframe)
-    df = compute_pre_pump_profile(df, timeframe)
-    df = compute_squeeze_features(df, timeframe)
-    df = compute_breakout_features(df, timeframe)
+    # Batch 1: Independent basic calculations
+    nc_ohlcv = compute_ohlcv_features(df, timeframe)
+    nc_atr = compute_atr_and_emas(df, timeframe)
+    nc_zscores = compute_zscores(df, timeframe)
+    nc_returns = compute_returns(df, timeframe)
+    nc_time = compute_time_features(df)
     
-    # Phase 5 Persistence
-    df = compute_persistence_features(df, timeframe)
+    batch1 = {**nc_ohlcv, **nc_atr, **nc_zscores, **nc_returns, **nc_time}
+    df_temp = pd.concat([df, pd.DataFrame(batch1, index=df.index)], axis=1)
     
-    # GT-PRO Features
-    df = compute_gt_pro_features(df, timeframe)
+    # Batch 2: First-order dependencies
+    nc_part = compute_participation_features(df_temp, timeframe)
+    nc_pre = compute_pre_pump_profile(df_temp, timeframe)
+    nc_squeeze = compute_squeeze_features(df_temp, timeframe)
     
-    # Exit Decay Features
-    df = compute_exit_decay_features(df, timeframe)
+    batch2 = {**nc_part, **nc_pre, **nc_squeeze}
+    df_temp = pd.concat([df_temp, pd.DataFrame(batch2, index=df.index)], axis=1)
+    
+    # Batch 3: Second-order dependencies
+    nc_breakout = compute_breakout_features(df_temp, timeframe)
+    nc_persist = compute_persistence_features(df_temp, timeframe)
+    
+    batch3 = {**nc_breakout, **nc_persist}
+    df_temp = pd.concat([df_temp, pd.DataFrame(batch3, index=df.index)], axis=1)
+    
+    # Batch 4: Third-order / Exit features
+    nc_gt = compute_gt_pro_features(df_temp, timeframe)
+    nc_exit = compute_exit_decay_features(df_temp, timeframe)
+    
+    batch4 = {**nc_gt, **nc_exit}
+    df_final = pd.concat([df_temp, pd.DataFrame(batch4, index=df.index)], axis=1)
     
     # Final Cleanup
-    df.fillna(0, inplace=True)
+    df_final.fillna(0, inplace=True)
  
-    return df
-def compute_market_structure_break(df: pd.DataFrame, timeframe: str = '15m', lookback_h=5) -> pd.DataFrame:
+    return df_final
+def compute_market_structure_break(df: pd.DataFrame, timeframe: str = '15m', lookback_h=5) -> dict:
     """
     GT-PRO #3: Market Structure Break (MSB).
     Detects if price breaks above the high of the last 'window' bars with volume expansion.
@@ -526,9 +538,9 @@ def compute_market_structure_break(df: pd.DataFrame, timeframe: str = '15m', loo
     new_cols['msb_bull'] = (df['close'] > new_cols['prev_high']) & (df['volume'] > vol_sma * 1.5)
     new_cols['msb_bear'] = (df['close'] < new_cols['prev_low']) & (df['volume'] > vol_sma * 1.5)
     
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_funding_capitulation(df: pd.DataFrame) -> pd.DataFrame:
+def compute_funding_capitulation(df: pd.DataFrame) -> dict:
     """
     GT-PRO #3: Funding Rate Capitulation.
     Detects when funding is deeply negative but price starts recovering.
@@ -536,22 +548,22 @@ def compute_funding_capitulation(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     if 'funding_rate' not in df.columns:
         new_cols['funding_capitulation'] = False
-        return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+        return new_cols
         
     negative_funding = df['funding_rate'] < -0.0002 # -0.2% or lower (adjusted for 8h)
     price_reversal = (df['close'] > df['open']) & (df['close'] > df['close'].shift(1))
     
     new_cols['funding_capitulation'] = negative_funding & price_reversal
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_cvd_acceleration(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_cvd_acceleration(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     GT-PRO #4: Velocity of Delta (V-Delta).
     Acceleration of CVD compared to price.
     """
     new_cols = {}
     if 'cvd' not in df.columns:
-        return df
+        return new_cols
         
     new_cols['cvd_velocity'] = df['cvd'].diff(1)
     new_cols['cvd_acceleration'] = new_cols['cvd_velocity'].diff(1)
@@ -559,13 +571,13 @@ def compute_cvd_acceleration(df: pd.DataFrame, timeframe: str = '15m') -> pd.Dat
     # Normalize by volume for cross-coin comparison (5h MA)
     ma_bars = TimeframeHelper.get_bars('5h', timeframe)
     new_cols['v_delta_score'] = new_cols['cvd_acceleration'] / (df['volume'].rolling(ma_bars).mean() + 1e-8)
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return new_cols
 
-def compute_gt_pro_features(df: pd.DataFrame, timeframe: str = '15m') -> pd.DataFrame:
+def compute_gt_pro_features(df: pd.DataFrame, timeframe: str = '15m') -> dict:
     """
     Orchestrates all GT-PRO feature calculations.
     """
-    df = compute_market_structure_break(df, timeframe)
-    df = compute_funding_capitulation(df)
-    df = compute_cvd_acceleration(df, timeframe)
-    return df
+    nc_msb = compute_market_structure_break(df, timeframe)
+    nc_funding = compute_funding_capitulation(df)
+    nc_cvd = compute_cvd_acceleration(df, timeframe)
+    return {**nc_msb, **nc_funding, **nc_cvd}

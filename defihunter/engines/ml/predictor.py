@@ -65,16 +65,27 @@ class MLPredictor:
             group['leader_prob'] = self._safe_predict_proba(suite["model_leader"], X_pred)
             group['setup_conversion_prob'] = self._safe_predict_proba(suite["model_setup"], X_pred)
             
-            # Predicted Rank Pct (0.0 is best) -> 0-100 Holdability
+            # Step 3: Compute Holdability Score (0-100)
+            # SEMANTICS: In labeling, rank(pct=True) is used where 1.0 = Top Gainer/Leader.
+            # Thus, Holdability (estimated probability of being a future leader) should be rank_pct * 100.
             if suite["model_hold"]:
                 rank_pct = suite["model_hold"].predict(X_pred)
-                group['holdability_score'] = (1.0 - np.clip(rank_pct, 0, 1)) * 100
+                group['holdability_score'] = np.clip(rank_pct, 0, 1) * 100
             else:
                 group['holdability_score'] = 50.0
             
-            group['ml_rank_score'] = (group['leader_prob'] * 0.5 + group['setup_conversion_prob'] * 0.3 + (group['holdability_score']/100) * 0.2) * 100
+            # Step 4: Final Composite Ranking Metric (0-100)
+            # Weighted blend of Discovery (Leader Probability), Entry Readiness, and Hold Quality.
+            group['ml_rank_score'] = (
+                group['leader_prob'] * 0.5 +
+                group['setup_conversion_prob'] * 0.3 +
+                (group['holdability_score'] / 100.0) * 0.2
+            ) * 100
+            
+            # Metadata / Explanations
             group['ml_explanation'] = group.apply(
-                lambda r: f"[FAMILY_RANKER] Prob: {r['leader_prob']:.1%} | Setup: {r['setup_conversion_prob']:.1%} | Hold: {r['holdability_score']:.1f}", axis=1
+                lambda x: f"LeaderP: {x['leader_prob']:.2f} | SetupP: {x['setup_conversion_prob']:.2f} | HoldQ: {x['holdability_score']:.1f}", 
+                axis=1
             )
         except Exception as e:
             logger.error(f"[ML-Predictor] Family-Ranker logic failed: {e}")
@@ -148,11 +159,11 @@ class MLPredictor:
             0.08 * _safe_series("quiet_expansion", 0.0).clip(0, 1)
         ).clip(0.0, 1.0)
 
-        df["leader_prob"] = df.get("leader_prob", (0.35 + 0.55 * h_score).clip(0.05, 0.95))
-        df["setup_conversion_prob"] = df.get("setup_conversion_prob", (0.30 + 0.60 * h_score).clip(0.05, 0.95))
-        df["holdability_score"] = df.get("holdability_score", (100.0 * (0.45 * h_score + 0.3 * _norm01(_safe_series("entry_readiness")))).clip(0, 100))
-        df["ml_rank_score"] = df.get("ml_rank_score", h_score * 100.0)
-        df["ml_explanation"] = df.get("ml_explanation", "[HEURISTIC_FALLBACK] Rule-consensus")
+        df["leader_prob"] = df.get("leader_prob", pd.Series(index=df.index)).fillna((0.35 + 0.55 * h_score).clip(0.05, 0.95))
+        df["setup_conversion_prob"] = df.get("setup_conversion_prob", pd.Series(index=df.index)).fillna((0.30 + 0.60 * h_score).clip(0.05, 0.95))
+        df["holdability_score"] = df.get("holdability_score", pd.Series(index=df.index)).fillna((100.0 * (0.45 * h_score + 0.3 * _norm01(_safe_series("entry_readiness")))).clip(0, 100))
+        df["ml_rank_score"] = df.get("ml_rank_score", pd.Series(index=df.index)).fillna(h_score * 100.0)
+        df["ml_explanation"] = df.get("ml_explanation", pd.Series(index=df.index)).fillna("[HEURISTIC_FALLBACK] Rule-consensus")
         
         # Aliases
         df["setup_quality_prob"] = df.get("setup_quality_prob", df["setup_conversion_prob"])

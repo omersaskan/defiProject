@@ -81,9 +81,12 @@ class RiskEngine:
         leader_prob: float,
         new_trade_notional: Optional[float],
         leverage: Optional[float] = None,
+        family_max_pos: Optional[int] = None,
+        symbol_data_map: Optional[dict] = None
     ) -> tuple[bool, str]:
         """
         Dynamic Position Manager with leadership awareness.
+        family_max_pos: If provided, overrides the family exposure cap logic.
         """
         from defihunter.utils.logger import logger
 
@@ -97,14 +100,18 @@ class RiskEngine:
         if effective_leverage <= 0:
             return False, "invalid_leverage"
 
-        # Rule: Max open positions
+        # 1. Rule: Max open positions (Global Cap)
         if len(current_portfolio) >= self.max_open_positions:
             return False, "max_open_positions_reached"
 
-        # Rule: Dynamic same-family exposure based on conviction
-        allowed_exposure = self.max_correlated_exposure
-        if leader_prob > 0.80:
-            allowed_exposure += 1
+        # 2. Rule: Family-specific exposure cap
+        # If family_max_pos is provided, it replaces the dynamic conviction-based logic.
+        if family_max_pos is not None:
+            allowed_exposure = family_max_pos
+        else:
+            allowed_exposure = self.max_correlated_exposure
+            if leader_prob > 0.80:
+                allowed_exposure += 1
 
         same_family_exposure = sum(
             1 for pos in current_portfolio if pos.get("family") == family
@@ -112,47 +119,42 @@ class RiskEngine:
         if same_family_exposure >= allowed_exposure:
             return False, f"max_family_exposure_reached ({allowed_exposure})"
 
-        # Rule: Daily Loss Killswitch
+        # 3. Rule: Daily Loss Killswitch
         if daily_loss_pct <= -self.max_daily_loss_pct:
             return False, "max_daily_loss_exceeded"
 
-        # Rule: No averaging down / duplicated symbols
+        # 4. Rule: No averaging down / duplicated symbols
         existing_symbols = [pos.get("symbol") for pos in current_portfolio]
         if symbol in existing_symbols:
             return False, "already_in_position_no_averaging_down"
 
-        # Rule: Correlation
+        # 5. Rule: Correlation check
         if existing_symbols:
             try:
-                corr_data = self.corr_engine.calculate_correlation(symbol, existing_symbols)
+                corr_data = self.corr_engine.calculate_correlation(symbol, existing_symbols, symbol_data_map=symbol_data_map)
                 mean_corr = corr_data.get("mean_corr", 0.0)
                 if mean_corr > self.max_avg_correlation:
                     return False, f"high_portfolio_correlation ({mean_corr:.2f})"
             except Exception as e:
                 logger.error(
-                    f"Correlation engine CRITICAL error for {symbol}: {e}. "
-                    f"Vetoing trade for safety.",
-                    exc_info=True
+                    f"Correlation engine error for {symbol}: {e}. Vetoing for safety."
                 )
                 return False, "correlation_engine_error"
 
-        # Margin required = sum(notional / leverage)
+        # 6. Margin check
         current_margin_usd = 0.0
         for pos in current_portfolio:
             pos_size = float(pos.get("size_usd", 0.0) or 0.0)
             pos_leverage = float(pos.get("leverage", effective_leverage) or effective_leverage)
-            if pos_leverage <= 0:
-                pos_leverage = effective_leverage
+            if pos_leverage <= 0: pos_leverage = effective_leverage
             current_margin_usd += pos_size / pos_leverage
 
         new_margin_req = new_trade_notional / effective_leverage
         total_margin_req = current_margin_usd + new_margin_req
 
-        # Leave liquidation buffer
         max_margin = equity_val * (1.0 - self.liquidation_buffer)
         if total_margin_req > max_margin:
-            reason = (f"insufficient_margin_buffer "
-                      f"(using {total_margin_req:.1f}$ of max {max_margin:.1f}$)")
+            reason = f"insufficient_margin_buffer ({total_margin_req:.1f}$ > {max_margin:.1f}$)"
             s_logger.log("RiskEngine", "TRADE_REJECTED", symbol=symbol, data={"reason": reason})
             return False, reason
 

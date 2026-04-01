@@ -54,7 +54,9 @@ class DatabaseManager:
                 regime VARCHAR,
                 universe_size INTEGER,
                 duration_ms DOUBLE,
-                total_balance DOUBLE
+                total_balance DOUBLE,
+                degraded_funding INTEGER DEFAULT 0,
+                degraded_oi INTEGER DEFAULT 0
             )
         """)
 
@@ -108,12 +110,19 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"[DB] Trade logging failed: {e}")
 
-    def log_scan(self, timestamp: datetime, regime: str, universe_size: int, duration_ms: float, balance: float):
+    def log_scan(self, timestamp: datetime, regime: str, universe_size: int, duration_ms: float, balance: float, degraded_funding: int = 0, degraded_oi: int = 0):
         try:
+            # Handle potential missing columns from legacy schema without crashing
+            try:
+                self.conn.execute("ALTER TABLE scans ADD COLUMN degraded_funding INTEGER DEFAULT 0")
+                self.conn.execute("ALTER TABLE scans ADD COLUMN degraded_oi INTEGER DEFAULT 0")
+            except:
+                pass
+                
             self.conn.execute("""
-                INSERT OR REPLACE INTO scans (timestamp, regime, universe_size, duration_ms, total_balance)
-                VALUES (?, ?, ?, ?, ?)
-            """, (timestamp, regime, universe_size, duration_ms, balance))
+                INSERT OR REPLACE INTO scans (timestamp, regime, universe_size, duration_ms, total_balance, degraded_funding, degraded_oi)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, regime, universe_size, duration_ms, balance, degraded_funding, degraded_oi))
         except Exception as e:
             logger.error(f"[DB] Scan logging failed: {e}")
 

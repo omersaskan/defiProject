@@ -83,31 +83,44 @@ class SignalPipeline:
         scan_timestamp = scan_timestamp or start_t
         
         # STAGE 1: Global Context
+        t0 = datetime.now()
         regime_label, sector_data, adaptive_weights, volat_label = self._stage_context(
             anchor_context, regime_label, sector_data, adaptive_weights, volatility_label
         )
+        t1 = datetime.now()
 
         # STAGE 2: Per-Symbol Feature Enrichment (Leadership, Profiles)
         symbol_context_map, processed_data_map = self._stage_symbol_features(
             symbol_data_map, anchor_context
         )
+        t2 = datetime.now()
 
         # STAGE 3: Family Stats & Scoring (Aggregations, Rules, Thresholds)
         family_stats, all_last_rows = self._stage_scoring(
-            processed_data_map, symbol_context_map, regime_label, sector_data, adaptive_weights, volat_label
+            processed_data_map, symbol_context_map, regime_label, sector_data, adaptive_weights, volat_label, mode
         )
+        t3 = datetime.now()
 
         if not all_last_rows:
             return self._empty_result(regime_label, sector_data, family_stats, mode, scan_timestamp)
 
         # STAGE 4: Global Ranking (ML, Cross-sectional Features)
         master_df = self._stage_ranking(all_last_rows, mode)
+        t4 = datetime.now()
 
         # STAGE 5: Decision Logic (Final Selection)
         final_decisions = self._stage_decide(master_df)
+        t5 = datetime.now()
 
         # Compile Metadata & Return
         metadata = self._build_metadata(start_t, scan_timestamp, mode, adaptive_weights)
+        metadata['timings'] = {
+            "s_context_ms": (t1 - t0).total_seconds() * 1000,
+            "s_sym_feats_ms": (t2 - t1).total_seconds() * 1000,
+            "s_scoring_eval_ms": (t3 - t2).total_seconds() * 1000,
+            "s_ranking_ml_ms": (t4 - t3).total_seconds() * 1000,
+            "s_decision_ms": (t5 - t4).total_seconds() * 1000,
+        }
         
         return PipelineResult(
             master_df=master_df,
@@ -161,7 +174,7 @@ class SignalPipeline:
             
         return symbol_context_map, processed_data_map
 
-    def _stage_scoring(self, processed_data_map, symbol_context_map, regime, sector, weights, volatility):
+    def _stage_scoring(self, processed_data_map, symbol_context_map, regime, sector, weights, volatility, mode="live"):
         """Stage 3: Cross-sectional aggregation and rule-based scoring."""
         family_stats = self.family_aggregator.compute_family_stats(processed_data_map, timeframe=self.timeframe)
         all_last_rows = []
@@ -173,11 +186,28 @@ class SignalPipeline:
             res_thresholds = self.threshold_engine.resolve_thresholds(regime=regime, family=ctx["family"], volatility=volatility)
             ctx["resolved_thresholds"] = res_thresholds
             
-            df = self.rule_engine.evaluate(
-                df, regime=regime, family=ctx["family"], 
-                resolved_thresholds=res_thresholds, sector_data=sector,
-                adaptive_weights=weights, primary_anchor=ctx["primary_anchor"]
-            )
+            if mode in ["live", "shadow"] and not df.empty:
+                # Optimize by evaluating only the ultimate bar for rules and string explanations
+                last_row_df = df.iloc[[-1]].copy()
+                last_row_df = self.rule_engine.evaluate(
+                    last_row_df, regime=regime, family=ctx["family"], 
+                    resolved_thresholds=res_thresholds, sector_data=sector,
+                    adaptive_weights=weights, primary_anchor=ctx["primary_anchor"]
+                )
+                
+                # Re-integrate evaluated final row back into existing historical array
+                df_hist = df.iloc[:-1].copy()
+                # Initialize new rule columns with NaN for historical rows to allow concat
+                for c in last_row_df.columns:
+                    if c not in df_hist.columns:
+                        df_hist[c] = float('nan') if last_row_df[c].dtype.kind in 'bcif' else None
+                df = pd.concat([df_hist, last_row_df])
+            else:
+                df = self.rule_engine.evaluate(
+                    df, regime=regime, family=ctx["family"], 
+                    resolved_thresholds=res_thresholds, sector_data=sector,
+                    adaptive_weights=weights, primary_anchor=ctx["primary_anchor"]
+                )
             
             if not df.empty:
                 last_bar = df.tail(1).to_dict("records")[0]

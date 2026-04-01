@@ -87,7 +87,7 @@ def filter_universe(
 
     return df[mask]
 
-def rank_by_relative_volume(
+async def rank_by_relative_volume(
     symbols: List[str],
     fetcher,
     timeframe: str = "1h",
@@ -100,25 +100,34 @@ def rank_by_relative_volume(
     Returns top_n coins with the most anomalous volume activity today.
     """
     rvr_scores = []
+    import asyncio
+    sem = asyncio.Semaphore(15)
 
-    for sym in symbols:
-        try:
-            df = fetcher.fetch_ohlcv(sym, timeframe=timeframe, limit=lookback_bars)
-            if df.empty or len(df) < 50:
-                continue
+    async def _fetch_and_score(sym):
+        async with sem:
+            try:
+                df = await fetcher.async_fetch_ohlcv(sym, timeframe=timeframe, limit=lookback_bars)
+                if df.empty or len(df) < 50:
+                    return None
 
-            vol = df["volume"].values
+                vol = df["volume"].values
 
-            baseline_bars = vol[:-24] if len(vol) > 48 else vol
-            avg_7d = float(np.mean(baseline_bars)) if len(baseline_bars) > 0 else 1.0
-            last_24h_vol = float(np.sum(vol[-24:]))
-            rvr = last_24h_vol / (avg_7d * 24 + 1e-8)
+                baseline_bars = vol[:-24] if len(vol) > 48 else vol
+                avg_7d = float(np.mean(baseline_bars)) if len(baseline_bars) > 0 else 1.0
+                last_24h_vol = float(np.sum(vol[-24:]))
+                rvr = last_24h_vol / (avg_7d * 24 + 1e-8)
 
-            rvr_scores.append((sym, rvr))
+                return (sym, rvr)
+            except Exception as e:
+                logger.warning(f"RVR anomaly fetch failed for {sym}: {e}", exc_info=True)
+                return None
 
-        except Exception as e:
-            logger.warning(f"RVR anomaly fetch failed for {sym}: {e}", exc_info=True)
-            continue
+    tasks = [_fetch_and_score(sym) for sym in symbols]
+    results = await asyncio.gather(*tasks)
+
+    for res in results:
+        if res:
+            rvr_scores.append(res)
 
     rvr_scores.sort(key=lambda x: x[1], reverse=True)
     top_symbols = [sym for sym, _ in rvr_scores[:top_n]]
@@ -129,21 +138,13 @@ def rank_by_relative_volume(
             logger.info(f"  {sym}: RVR={rvr:.2f}x")
 
     return top_symbols
-def build_anomaly_watchlist(symbols: List[str], fetcher, criteria: Optional[dict] = None) -> List[str]:
+async def build_anomaly_watchlist(symbols: List[str], fetcher, criteria: Optional[dict] = None) -> List[str]:
     """
     GT-NEW-8: Anomaly Pre-Scanner — fast multi-criteria watchlist builder.
     
     Quickly scores each coin on 4 anomaly dimensions using only the last 50 bars.
     Only coins scoring above threshold proceed to full feature pipeline analysis.
     This reduces full-analysis cost by 60-80% while retaining 95%+ of signals.
-    
-    Anomaly criteria:
-    1. Volume Z-score > 2.0 (unusual volume today)
-    2. BB width percentile in bottom 20% (tight squeeze)
-    3. Funding rate < -0.001 (crowd heavily short)
-    4. 24h price change < 3% (coiling tight)
-    
-    A coin qualifies if it meets 2+ criteria.
     """
     if criteria is None:
         criteria = {
@@ -154,50 +155,60 @@ def build_anomaly_watchlist(symbols: List[str], fetcher, criteria: Optional[dict
         }
     
     watchlist = []
-    
-    for sym in symbols:
-        try:
-            df = fetcher.fetch_ohlcv(sym, timeframe='15m', limit=100)
-            if df.empty or len(df) < 30:
-                continue
-            
-            score = 0
-            
-            # Criterion 1: Volume anomaly
-            vol = df['volume'].values
-            vol_mean = np.mean(vol[:-5]) if len(vol) > 10 else np.mean(vol)
-            vol_std = np.std(vol[:-5]) + 1e-8
-            vol_zscore = (vol[-1] - vol_mean) / vol_std
-            if vol_zscore > criteria.get('volume_zscore_threshold', 2.0):
-                score += 1
-            
-            # Criterion 2: Price coiling (tight range last 24 bars)
-            if len(df) >= 24:
-                h24 = df['high'].iloc[-24:].max()
-                l24 = df['low'].iloc[-24:].min()
-                range_pct = (h24 / (l24 + 1e-8)) - 1
-                if range_pct < criteria.get('price_range_threshold', 0.03):
-                    score += 1
-            
-            # Criterion 3: Negative funding (crowd short)
-            if 'funding_rate' in df.columns:
-                fr = df['funding_rate'].iloc[-1]
-                if fr < criteria.get('funding_threshold', -0.001):
-                    score += 1
-            
-            # Criterion 4: Volume building (last 4 bars all > median)
-            if len(vol) >= 20:
-                med = np.median(vol[-20:-4])
-                recent_above = sum(v > med for v in vol[-4:])
-                if recent_above >= 3:
-                    score += 1
-            
-            if score >= criteria.get('min_criteria_met', 2):
-                watchlist.append((sym, score))
+    import asyncio
+    sem = asyncio.Semaphore(15)
+
+    async def _fetch_and_eval(sym):
+        async with sem:
+            try:
+                df = await fetcher.async_fetch_ohlcv(sym, timeframe='15m', limit=100)
+                if df.empty or len(df) < 30:
+                    return None
                 
-        except Exception as e:
-            logger.warning(f"Anomaly watchlist fetch failed for {sym}: {e}", exc_info=True)
-            continue
+                score = 0
+                
+                # Criterion 1: Volume anomaly
+                vol = df['volume'].values
+                vol_mean = np.mean(vol[:-5]) if len(vol) > 10 else np.mean(vol)
+                vol_std = np.std(vol[:-5]) + 1e-8
+                vol_zscore = (vol[-1] - vol_mean) / vol_std
+                if vol_zscore > criteria.get('volume_zscore_threshold', 2.0):
+                    score += 1
+                
+                # Criterion 2: Price coiling
+                if len(df) >= 24:
+                    h24 = df['high'].iloc[-24:].max()
+                    l24 = df['low'].iloc[-24:].min()
+                    range_pct = (h24 / (l24 + 1e-8)) - 1
+                    if range_pct < criteria.get('price_range_threshold', 0.03):
+                        score += 1
+                
+                # Criterion 3: Negative funding
+                if 'funding_rate' in df.columns:
+                    fr = df['funding_rate'].iloc[-1]
+                    if fr < criteria.get('funding_threshold', -0.001):
+                        score += 1
+                
+                # Criterion 4: Volume building
+                if len(vol) >= 20:
+                    med = np.median(vol[-20:-4])
+                    recent_above = sum(v > med for v in vol[-4:])
+                    if recent_above >= 3:
+                        score += 1
+                
+                if score >= criteria.get('min_criteria_met', 2):
+                    return (sym, score)
+                return None
+            except Exception as e:
+                logger.warning(f"Anomaly watchlist fetch failed for {sym}: {e}", exc_info=True)
+                return None
+
+    tasks = [_fetch_and_eval(sym) for sym in symbols]
+    results = await asyncio.gather(*tasks)
+    
+    for res in results:
+        if res:
+            watchlist.append(res)
     
     # Sort by score desc
     watchlist.sort(key=lambda x: x[1], reverse=True)

@@ -111,15 +111,17 @@ class LeadershipEngine:
             if anchor not in anchor_data:
                 continue
                 
-            adf = anchor_data[anchor].copy()
+            adf = anchor_data[anchor]
             
             # Align anchor index
             if 'timestamp' in df.columns and 'timestamp' in adf.columns:
-                adf = adf.sort_values('timestamp').reset_index(drop=True)
-                if len(adf) != len(df):
+                if len(adf) != len(df) or not (adf['timestamp'].values == df['timestamp'].values).all():
+                    # Only copy and align if they truly diverge, usually they are strictly identical
+                    adf = adf.copy()
+                    adf = adf.sort_values('timestamp').reset_index(drop=True)
                     if len(adf) > len(df):
                         adf = adf.tail(len(df)).reset_index(drop=True)
-                    else:
+                    elif len(adf) < len(df):
                         adf = adf.reindex(range(len(df))).ffill().bfill()
             
             for length in self.ema_lengths:
@@ -135,7 +137,7 @@ class LeadershipEngine:
                 spread_col = f'rel_spread_{anchor_name}_ema{length}'
                 
                 # Base Spread
-                spread_vals = np.log(coin_close / coin_ema) - np.log(anchor_close / anchor_ema)
+                spread_vals = np.log((coin_close + 1e-8) / (coin_ema + 1e-8)) - np.log((anchor_close + 1e-8) / (anchor_ema + 1e-8))
                 new_cols[spread_col] = spread_vals
                 
                 # 1. Slope (timeframe-aware)
