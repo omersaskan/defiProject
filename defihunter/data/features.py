@@ -156,15 +156,17 @@ def compute_participation_features(df: pd.DataFrame, timeframe: str = '15m') -> 
             new_cols['orderbook_vacuum'] = False
             
     else:
-        new_cols['volume_delta'] = 0.0
-        new_cols['cvd'] = 0.0
-        new_cols['cvd_zscore'] = 0.0
-        new_cols['cvd_slope_4'] = 0.0
-        new_cols['buying_pressure'] = 0.0
-        new_cols['taker_buy_ratio'] = 0.5
-        new_cols['taker_ratio_zscore'] = 0.0
-        new_cols['taker_surge'] = False
-        new_cols['orderbook_vacuum'] = False
+        # If columns genuinely don't exist, keep them as NaN (representing missingness)
+        # and downstream logic/ML can handle it.
+        new_cols['volume_delta'] = np.nan
+        new_cols['cvd'] = np.nan
+        new_cols['cvd_zscore'] = np.nan
+        new_cols['cvd_slope_4'] = np.nan
+        new_cols['buying_pressure'] = np.nan
+        new_cols['taker_buy_ratio'] = np.nan
+        new_cols['taker_ratio_zscore'] = np.nan
+        new_cols['taker_surge'] = np.nan
+        new_cols['orderbook_vacuum'] = np.nan
             
     if 'open_interest' in df.columns:
         # Avoid 0 / 0 == NaN by mapping to 0 if original is 0
@@ -519,8 +521,11 @@ def build_feature_pipeline(raw_data: pd.DataFrame, timeframe: str = '15m') -> pd
     batch4 = {**nc_gt, **nc_exit}
     df_final = pd.concat([df_temp, pd.DataFrame(batch4, index=df.index)], axis=1)
     
-    # Final Cleanup
-    df_final.fillna(0, inplace=True)
+    # Final Cleanup: Selective fillna
+    # Only fillna(0) for basic technical indicators (EMA, ATR) to prevent chain failures,
+    # but KEEP microstructure (taker/cvd) and sentiment (OI/Funding) as NaN if missing.
+    basic_cols = [c for c in df_final.columns if 'ema' in c or 'atr' in c or 'rsi' in c]
+    df_final[basic_cols] = df_final[basic_cols].fillna(0)
  
     return df_final
 def compute_market_structure_break(df: pd.DataFrame, timeframe: str = '15m', lookback_h=5) -> dict:

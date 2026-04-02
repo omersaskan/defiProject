@@ -44,36 +44,41 @@ def load_config(path: str):
     return None
 
 
-def fetch_dataset(config, days: int = 7, limit: int = 40) -> tuple[pd.DataFrame, dict]:
-    """Fetch OHLCV for defi universe, return (cross_df, family_map)."""
+def fetch_dataset(config, days: int = 7, limit: int = 40, live_fallback: bool = False) -> tuple[pd.DataFrame, dict]:
+    """Fetch OHLCV for defi universe, preferring local TSDB (Parquet)."""
+    from defihunter.data.storage import TSDBManager
+    tsdb = TSDBManager()
     fetcher  = BinanceFuturesFetcher()
     universe = fetcher.get_defi_universe(config=config)[:limit]
     bars     = (days + 1) * 24 * 4  # 15m bars
 
     from defihunter.engines.leadership import LeadershipEngine
     from defihunter.engines.family import FamilyEngine
-    from defihunter.engines.rules import RuleEngine
-    from defihunter.engines.thresholds import ThresholdResolutionEngine
+    from defihunter.engines.regime import MarketRegimeEngine
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
     anchors    = getattr(config, "anchors", ["BTC.p", "ETH.p"]) if config else ["BTC.p", "ETH.p"]
     anchor_dfs = {}
+    
     for a in anchors:
-        try:
+        df = tsdb.load_dataframe(a, "15m")
+        if df.empty and live_fallback:
+            logger.info(f"[Ablation] TSDB empty for anchor {a}, falling back to live.")
             df = fetcher.fetch_ohlcv(a, timeframe="15m", limit=bars)
-            if not df.empty:
-                anchor_dfs[a] = build_feature_pipeline(df)
-        except Exception:
-            pass
+        
+        if not df.empty:
+            df = build_feature_pipeline(df)
+            anchor_dfs[a] = df
+            
+    if not anchor_dfs:
+        logger.error("[Ablation] No anchor data found in TSDB. Use --live-fallback to fetch from Binance.")
+        return pd.DataFrame(), {}
 
     family_engine    = FamilyEngine(config) if config else None
     leadership_engine = LeadershipEngine(anchors=anchors, ema_lengths=[20, 55])
-    rule_engine       = RuleEngine()
-    threshold_engine  = ThresholdResolutionEngine(config.regimes if config else None, config=config)
-
-    from defihunter.engines.regime import MarketRegimeEngine
     regime_engine = MarketRegimeEngine()
+    
     btc_anch = next((a for a in anchor_dfs if "BTC" in a), None)
     eth_anch = next((a for a in anchor_dfs if "ETH" in a), None)
     regime_label = "trend"
@@ -87,9 +92,14 @@ def fetch_dataset(config, days: int = 7, limit: int = 40) -> tuple[pd.DataFrame,
 
     def fetch_one(sym):
         try:
-            df = fetcher.fetch_ohlcv(sym, timeframe="15m", limit=bars)
+            df = tsdb.load_dataframe(sym, "15m")
+            if df.empty and live_fallback:
+                logger.info(f"[Ablation] TSDB empty for {sym}, falling back to live.")
+                df = fetcher.fetch_ohlcv(sym, timeframe="15m", limit=bars)
+            
             if df.empty or len(df) < 55:
                 return
+            
             df = build_feature_pipeline(df)
             df = leadership_engine.add_leadership_features(df, anchor_dfs)
             fam = "defi_beta"
@@ -98,8 +108,7 @@ def fetch_dataset(config, days: int = 7, limit: int = 40) -> tuple[pd.DataFrame,
                     fam = family_engine.profile_coin(sym, historical_data=df).family_label
                 except Exception:
                     pass
-            # Bypass rule/threshold filters entirely for the ablation to ensure we get trades
-            # df = rule_engine.evaluate(df, regime=regime_label, family=fam, resolved_thresholds=th)
+                    
             df["symbol"] = sym
             df["family"] = fam
             df["historical_regime"] = regime_label
@@ -107,9 +116,9 @@ def fetch_dataset(config, days: int = 7, limit: int = 40) -> tuple[pd.DataFrame,
             df["entry_signal"] = df["close"] > df["close"].shift(1)
             df["fakeout_risk"] = 15.0  # default for ablation
             df["total_score"]  = 60.0  # dummy for BacktestEngine sorting
+            
             with lock:
                 sym_map[sym]    = df
-
                 family_map[sym] = fam
         except Exception as e:
             logger.warning(f"Fetch {sym}: {e}")
@@ -252,20 +261,24 @@ def render_report(results: list, output_path: str):
     print(f"\n✓ Ablation report written to: {output_path}")
 
 
-def main(config_path: str, output_path: str, days: int, limit: int):
+def main(config_path: str, output_path: str, days: int, limit: int, live_fallback: bool):
     print(f"\n{SEP}")
     print("  DefiHunter — Ablation Backtest (4 variants)")
     print(SEP)
 
     config = load_config(config_path)
-    print("\n[1/3] Fetching dataset...")
-    cross_df, family_map = fetch_dataset(config, days=days, limit=limit)
+    print("\n[1/3] Fetching dataset (TSDB First)...")
+    cross_df, family_map = fetch_dataset(config, days=days, limit=limit, live_fallback=live_fallback)
 
     if cross_df.empty:
-        print("✗ No data fetched. Exiting.")
+        print("✗ No data fetched (TSDB empty and live-fallback disabled). Exiting.")
         return
 
     print(f"  → {len(cross_df)} rows, {cross_df['symbol'].nunique()} symbols")
+    
+    # Audit: report source distribution
+    if 'source' in cross_df.columns:
+        print(f"  → Source dist: {cross_df['source'].value_counts().to_dict()}")
 
     VARIANTS = ["v1_baseline", "v2_stop_only", "v2_with_families", "v2_perp_watch"]
     results  = []
@@ -292,5 +305,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="reports/ablation_report.md")
     parser.add_argument("--days",   type=int, default=7)
     parser.add_argument("--limit",  type=int, default=40)
+    parser.add_argument("--live-fallback", action="store_true", help="Explicitly allow fall back to Binance if TSDB is empty")
     args = parser.parse_args()
-    main(args.config, args.output, args.days, args.limit)
+    main(args.config, args.output, args.days, args.limit, args.live_fallback)

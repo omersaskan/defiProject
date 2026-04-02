@@ -53,11 +53,13 @@ class MLTrainer:
         success_chop = False
         
         if len(df_trend) > 1000:
-            logger.info("Equipping GLOBAL_TREND Model...")
+            source_dist = df_trend['source'].value_counts().to_dict() if 'source' in df_trend.columns else "unknown"
+            logger.info(f"Equipping GLOBAL_TREND Model... (Sources: {source_dist})")
             success_trend = self.train(df_trend, target_clf_col, target_short_col, target_reg_col, symbol="GLOBAL_TREND")
             
         if len(df_chop) > 1000:
-            logger.info("Equipping GLOBAL_CHOP Model...")
+            source_dist = df_chop['source'].value_counts().to_dict() if 'source' in df_chop.columns else "unknown"
+            logger.info(f"Equipping GLOBAL_CHOP Model... (Sources: {source_dist})")
             success_chop = self.train(df_chop, target_clf_col, target_short_col, target_reg_col, symbol="GLOBAL_CHOP")
             
         return success_trend or success_chop

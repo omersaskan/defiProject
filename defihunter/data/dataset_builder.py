@@ -208,11 +208,18 @@ class DatasetBuilder:
                                use_prepump_target: bool = True):
         """
         Returns X, y_df for model training. y_df contains multiple targets.
-        GT-GOLD-2: Prefers 'target_early_big' (composite gainer target) as primary.
+        Categorically excludes Phase 2 metadata and quality flags from X.
+        Enforces NaN-preservation for microstructure data.
         """
         df_labeled = self.generate_labels(df)
 
         if feature_cols is None:
+            # Categorical Exclusion of Metadata & Quality Flags
+            metadata_cols = [
+                'source', 'source_priority', 'bar_convention', 'ingested_at', 'is_synthetic',
+                'q_gap_detected', 'q_stale_price', 'q_zero_vol'
+            ]
+            
             exclude = ['timestamp', 'symbol', 'target_hit', 'short_target_hit', 'mfe_r',
                        'mae_r', 'exit_type', 'prepump_target', 'bars_to_target',
                        'open_time', 'close', 'high', 'low', 'open', 'volume', 'quote_volume',
@@ -222,29 +229,40 @@ class DatasetBuilder:
                        'future_6h_rank_in_family_pct', 'future_12h_rank_in_family_pct', 'future_24h_rank_in_family_pct',
                        'is_top3_family_next_24h', 'is_top_decile_family_next_12h',
                        'is_top3_overall', 'future_24h_rank_overall_pct', 'family_relative_alpha_24h']
+            
+            final_exclude = list(set(exclude + metadata_cols))
+            
             feature_cols = [c for c in df_labeled.columns
-                           if pd.api.types.is_numeric_dtype(df_labeled[c]) and c not in exclude]
+                           if pd.api.types.is_numeric_dtype(df_labeled[c]) and c not in final_exclude]
 
         # Drop rows that don't have a full window ahead
-        df_final = df_labeled.iloc[:-self.window].dropna(subset=feature_cols)
+        df_final = df_labeled.iloc[:-self.window]
+        
+        # NOTE: NaN handling - we do NOT fillna(0) here. 
+        # Downstream ML (LightGBM) handles NaNs by default. 
+        # We only drop rows if the target is NaN.
+        target_check_cols = ['target_hit', 'mfe_r']
+        df_final = df_final.dropna(subset=[c for c in target_check_cols if c in df_final.columns])
 
-        # Enforce relative ranking objectives instead of absolute pumping targets
+        # Enforce relative ranking objectives
         base_targets = ['target_hit', 'short_target_hit', 'mfe_r']
         optional_targets = ['is_top3_family_next_24h', 'is_top_decile_family_next_12h',
                             'future_24h_rank_in_family', 'family_relative_alpha_24h',
                             'target_early_big', 'is_hyper_gainer']
 
-        available_targets = base_targets + [c for c in optional_targets if c in df_final.columns]
-        y_targets = df_final[available_targets].copy()
+        # Add metadata columns back to y_targets for auditability/debug, NOT for X
+        metadata_to_keep = [c for c in df_final.columns if c in ['source', 'symbol', 'timestamp', 'q_gap_detected']]
+        target_cols = base_targets + [c for c in optional_targets if c in df_final.columns]
+        
+        y_targets = df_final[target_cols + metadata_to_keep].copy()
 
         if use_prepump_target and 'is_top3_family_next_24h' in df_final.columns:
-            logger.info("[DatasetBuilder] GT-RANKING: Using strictly is_top3_family_next_24h (Family Discovery)")
+            logger.info("[DatasetBuilder] Using is_top3_family_next_24h (Family Discovery)")
             y_targets['primary_clf'] = df_final['is_top3_family_next_24h']
         elif use_prepump_target and 'is_top_decile_family_next_12h' in df_final.columns:
-            logger.info("[DatasetBuilder] GT-RANKING: Using is_top_decile_family_next_12h")
+            logger.info("[DatasetBuilder] Using is_top_decile_family_next_12h")
             y_targets['primary_clf'] = df_final['is_top_decile_family_next_12h']
         else:
-            logger.warning("[DatasetBuilder] Family rank target not found, falling back to absolute hyper_gainer")
             if 'is_hyper_gainer' in df_final.columns:
                 y_targets['primary_clf'] = df_final['is_hyper_gainer']
             else:

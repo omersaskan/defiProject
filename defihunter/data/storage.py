@@ -21,7 +21,8 @@ class TSDBManager:
     def save_dataframe(self, df: pd.DataFrame, symbol: str, timeframe: str) -> bool:
         """
         Saves or appends a DataFrame to the Parquet TSDB.
-        Expects 'timestamp' column to be an exact datetime object.
+        GT-PORTAL FIX: Uses explicit (symbol, timeframe, timestamp) deduplication 
+        and preserves provenance metadata.
         """
         if df.empty or 'timestamp' not in df.columns:
             return False
@@ -30,13 +31,27 @@ class TSDBManager:
         
         # Ensure timestamp is datetime and sort
         df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df = df.sort_values('timestamp')
+        df['symbol'] = symbol
+        df['timeframe'] = timeframe
         
         try:
             if path.exists():
                 # Read existing, append, drop duplicates, re-save
                 existing_df = pd.read_parquet(path)
-                combined = pd.concat([existing_df, df]).drop_duplicates(subset=['timestamp'], keep='last')
+                
+                # If existing is missing provenance columns, add them with lowest priority
+                for col in ['source_priority', 'source', 'quality_flag', 'is_synthetic']:
+                    if col not in existing_df.columns:
+                        if col == 'source_priority': existing_df[col] = 0
+                        else: existing_df[col] = "LEGACY"
+                
+                combined = pd.concat([existing_df, df])
+                
+                # Priority-based deduplication: keys (sym, tf, ts) + priority (asc) -> keep last
+                dedup_keys = ['symbol', 'timeframe', 'timestamp']
+                combined = combined.sort_values(by=dedup_keys + ['source_priority'], ascending=True)
+                combined = combined.drop_duplicates(subset=dedup_keys, keep='last')
+                
                 combined = combined.sort_values('timestamp').reset_index(drop=True)
                 combined.to_parquet(path, compression='snappy', engine='pyarrow')
             else:
